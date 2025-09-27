@@ -331,8 +331,8 @@ def main():
             else:
                 st.error("❌ Failed to initialize ChatBot. Please check your configuration.")
                 return
-
-    # Welcome message if no messages exist
+    
+    # Welcome message - dynamic based on project status
     if not st.session_state.messages:
         if st.session_state.project_defined:
             project_context = st.session_state.project_context
@@ -364,76 +364,92 @@ def main():
             - "Our project is trying to target high levels of youth not in Education nor Training in Kenya"
             - "Our project focuses on improving educational access in rural areas of Asia"
             """)
-
+    
     # Display persistent citations if any exist
     if st.session_state.project_defined and st.session_state.get('all_citations'):
         display_persistent_citations()
-
-    # Display confirmation UI if awaiting confirmation
+    
+    # Display confirmation UI if awaiting confirmation (this handles the case when no new input is provided)
     if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
         display_confirmation_ui(st.session_state.pending_project_info)
-
-    # Chat input placeholder
-    chat_placeholder = "Ask me about your project..." if st.session_state.project_defined else "Describe your developmental project..."
+        return
     
-    # Capture user input
-    if prompt := st.chat_input(chat_placeholder):
-        # Append user message first
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        # Generate assistant response
-        if st.session_state.project_defined:
-            # Memory-enabled RAG mode
-            with st.spinner("Searching through policy documents..."):
-                response = handle_memory_chat_query(prompt, st.session_state.project_context)
-                st.session_state.first_rag_question_asked = True
-        else:
-            # Project definition mode
-            with st.spinner("Analyzing your project description..."):
-                project_info = extract_project_info(prompt)
-
-                if project_info:
-                    if not project_info.get('is_relevant', False):
-                        response = generate_follow_up_prompt([], False)
-                    else:
-                        missing_info = project_info.get('missing_info', [])
-                        if not missing_info:
-                            # All info captured, show confirmation UI
-                            st.session_state.awaiting_confirmation = True
-                            st.session_state.pending_project_info = project_info
-                            
-                            response = generate_project_summary(project_info)
-                            response += "\n\n✅ **I've extracted your project information!**\n\n"
-                            response += "**Please review and edit the information below before we proceed.**"
-                        else:
-                            # Missing information
-                            response = generate_follow_up_prompt(missing_info, True)
-                else:
-                    response = "I'm having trouble processing your project description. Please try again with a clear description of your developmental project."
-
-        # Add assistant response to session messages
-        st.session_state.messages.append({"role": "assistant", "content": response})
-
-        # If awaiting confirmation, re-run to immediately show confirmation UI
-        if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
-            st.rerun()
-            return
-
-    # Render all chat messages above the input
+    # Display all chat messages (conversation history)
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            if message["role"] == "assistant" and st.session_state.project_defined and st.session_state.first_rag_question_asked:
-                try:
-                    processed_response, citation_mapping = process_and_display_citations(message["content"])
-                    st.markdown(processed_response)
-                    if citation_mapping:
-                        display_citation_expanders(citation_mapping)
-                except Exception as e:
-                    st.markdown(message["content"])
-                    st.warning(f"Citation processing failed: {str(e)}")
+            st.markdown(message["content"])
+    
+    # Chat input - dynamic placeholder based on project status
+    chat_placeholder = "Ask me about your project..." if st.session_state.project_defined else "Describe your developmental project..."
+    
+    if prompt := st.chat_input(chat_placeholder):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            rag_context = ""  # Initialize rag_context for all responses
+            if st.session_state.project_defined:
+                # Memory-enabled RAG mode - handle questions about the defined project
+                with st.spinner("Searching through policy documents..."):
+                    response = handle_memory_chat_query(prompt, st.session_state.project_context)
+                    # Mark that the first RAG question has been asked
+                    st.session_state.first_rag_question_asked = True
             else:
-                st.markdown(message["content"])
-
+                # Project definition mode
+                with st.spinner("Analyzing your project description..."):
+                    # Extract project information
+                    project_info = extract_project_info(prompt)
+                    
+                    if project_info:
+                        # Check if project is relevant
+                        if not project_info.get('is_relevant', False):
+                            response = generate_follow_up_prompt([], False)
+                        else:
+                            # Check for missing information
+                            missing_info = project_info.get('missing_info', [])
+                            
+                            if not missing_info:
+                                # All information captured - show confirmation UI
+                                st.session_state.awaiting_confirmation = True
+                                st.session_state.pending_project_info = project_info
+                                
+                                response = generate_project_summary(project_info)
+                                response += "\n\n✅ **I've extracted your project information!**\n\n"
+                                response += "**Please review and edit the information below before we proceed.**"
+                            else:
+                                # Missing information
+                                response = generate_follow_up_prompt(missing_info, True)
+                    else:
+                        response = "I'm having trouble processing your project description. Please try again with a clear description of your developmental project."
+        
+        # Display assistant response with citations
+        if st.session_state.project_defined and st.session_state.first_rag_question_asked:
+            # For RAG responses, process citations
+            try:
+                # Process citations and display with expanders (uses direct Weaviate queries)
+                processed_response, citation_mapping = process_and_display_citations(response)
+                st.markdown(processed_response)
+                
+                # Display citation expanders for this response
+                if citation_mapping:
+                    display_citation_expanders(citation_mapping)
+                else:
+                    # Fallback to regular display if no context available
+                    st.markdown(response)
+            except Exception as e:
+                # Fallback to regular display if citation processing fails
+                st.markdown(response)
+                st.warning(f"Citation processing failed: {str(e)}")
+        else:
+            # For non-RAG responses, display normally
+            st.markdown(response)
+        
+        # If we're awaiting confirmation, add response to messages and return
+        if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.rerun()
+            return
         
 
         #### Update this later to add more features to the response already geenrated ####
