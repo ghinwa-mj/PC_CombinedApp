@@ -357,7 +357,7 @@ def main():
         display_confirmation_ui(st.session_state.pending_project_info)
         return
     
-    # Display chat messages (previous conversation)
+    # Display all chat messages (conversation history)
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -368,10 +368,6 @@ def main():
     if prompt := st.chat_input(chat_placeholder):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Display user message immediately
-        with st.chat_message("user"):
-            st.markdown(prompt)
         
         # Generate response
         with st.chat_message("assistant"):
