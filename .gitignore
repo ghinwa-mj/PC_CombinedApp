@@ -1,5 +1,5 @@
 # API Keys and sensitive information
-# apikeys.py  # Commented out since we want to include it in this repository
+apikeys.py
 *.env
 .env
 .env.local
@@ -57,6 +57,7 @@ logs/
 
 # Streamlit
 .streamlit/
+.streamlit/secrets.toml
 
 # Temporary files
 *.tmp
