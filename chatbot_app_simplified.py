@@ -357,7 +357,7 @@ def main():
         display_confirmation_ui(st.session_state.pending_project_info)
         return
     
-    # Display chat messages
+    # Display chat messages (previous conversation)
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -368,6 +368,10 @@ def main():
     if prompt := st.chat_input(chat_placeholder):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
         
         # Generate response
         with st.chat_message("assistant"):
@@ -460,6 +464,8 @@ def main():
             st.session_state.messages.append({"role": "assistant", "content": response})
             # Increment message count for citation tracking
             st.session_state.message_count += 1
+            # Rerun to show the new message in conversation history
+            st.rerun()
     
     # Sidebar with project context
     with st.sidebar:
