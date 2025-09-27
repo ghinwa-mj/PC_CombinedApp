@@ -348,11 +348,6 @@ def main():
             - "Our project focuses on improving educational access in rural areas of Asia"
             """)
     
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
     # Display persistent citations if any exist
     if st.session_state.project_defined and st.session_state.get('all_citations'):
         display_persistent_citations()
@@ -362,6 +357,10 @@ def main():
         display_confirmation_ui(st.session_state.pending_project_info)
         return
     
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     
     # Chat input - dynamic placeholder based on project status
     chat_placeholder = "Ask me about your project..." if st.session_state.project_defined else "Describe your developmental project..."
@@ -369,10 +368,6 @@ def main():
     if prompt := st.chat_input(chat_placeholder):
         # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
         
         # Generate response
         with st.chat_message("assistant"):

@@ -139,13 +139,7 @@ SEGMENTATION_OPTIONS = {
     }
 }
 
-# Set page config
-st.set_page_config(
-    page_title="Policy CoPilot Visualization Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Page config is handled by main_app.py
 
 # Custom CSS for styling the squares
 st.markdown("""
