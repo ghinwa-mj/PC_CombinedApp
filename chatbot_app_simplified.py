@@ -22,29 +22,32 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize session state - This is important for the chatbot to remember the state of the conversation
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "project_context" not in st.session_state:
-    st.session_state.project_context = {}
-if "chatbot_initialized" not in st.session_state:
-    st.session_state.chatbot_initialized = False
-if "chatbot_components" not in st.session_state:
-    st.session_state.chatbot_components = None
-if "project_defined" not in st.session_state:
-    st.session_state.project_defined = False
-if "first_rag_question_asked" not in st.session_state:
-    st.session_state.first_rag_question_asked = False
-if "awaiting_confirmation" not in st.session_state:
-    st.session_state.awaiting_confirmation = False
-if "pending_project_info" not in st.session_state:
-    st.session_state.pending_project_info = {}
-if "memory_app" not in st.session_state:
-    st.session_state.memory_app = None
-if "conversation_thread_id" not in st.session_state:
-    st.session_state.conversation_thread_id = None
-if "message_count" not in st.session_state:
-    st.session_state.message_count = 0
+def initialize_chatbot_session_state():
+    """Initialize all chatbot session state variables"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "project_context" not in st.session_state:
+        st.session_state.project_context = {}
+    if "chatbot_initialized" not in st.session_state:
+        st.session_state.chatbot_initialized = False
+    if "chatbot_components" not in st.session_state:
+        st.session_state.chatbot_components = None
+    if "project_defined" not in st.session_state:
+        st.session_state.project_defined = False
+    if "first_rag_question_asked" not in st.session_state:
+        st.session_state.first_rag_question_asked = False
+    if "awaiting_confirmation" not in st.session_state:
+        st.session_state.awaiting_confirmation = False
+    if "pending_project_info" not in st.session_state:
+        st.session_state.pending_project_info = {}
+    if "memory_app" not in st.session_state:
+        st.session_state.memory_app = None
+    if "conversation_thread_id" not in st.session_state:
+        st.session_state.conversation_thread_id = None
+    if "message_count" not in st.session_state:
+        st.session_state.message_count = 0
+    if "chatbot_started" not in st.session_state:
+        st.session_state.chatbot_started = False
 
 # Initialize chatbot components
 def cleanup_weaviate_client():
@@ -511,6 +514,11 @@ def main():
             # Reset citation tracking
             st.session_state.message_count = 0
             st.session_state.all_citations = {}
+            st.rerun()
+        
+        if st.button("⏹️ Stop Chat"):
+            st.session_state.chatbot_started = False
+            cleanup_weaviate_client()
             st.rerun()
         
         # Clear citations button

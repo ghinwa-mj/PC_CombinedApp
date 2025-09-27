@@ -7,7 +7,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 # Import the individual apps
-from chatbot_app_simplified import main as chatbot_main
+from chatbot_app_simplified import main as chatbot_main, initialize_chatbot_session_state
 from visualization_app import main as visualization_main
 
 # Page configuration
@@ -73,6 +73,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def main():
+    # Initialize session state globally
+    initialize_chatbot_session_state()
+    
     # Main header
     st.markdown("""
     <div class="main-header">
@@ -94,14 +97,24 @@ def main():
         literature to understand definitions, measurements, drivers, and variations in developmental outcomes.
         
         **How to use:**
-        1. Describe your developmental project
-        2. Ask questions about definitions, measurements, drivers, or variations
-        3. Get comprehensive answers with citations from our policy document database
+        1. Click "Let's Chat" to start the chatbot
+        2. Describe your developmental project
+        3. Ask questions about definitions, measurements, drivers, or variations
+        4. Get comprehensive answers with citations from our policy document database
         """)
         st.markdown("---")
         
-        # Run the chatbot app
-        chatbot_main()
+        # Add a button to start the chatbot
+        if not st.session_state.get('chatbot_started', False):
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                if st.button("🚀 Let's Chat!", key="start_chatbot", type="primary", use_container_width=True):
+                    st.session_state.chatbot_started = True
+                    st.rerun()
+        
+        # Run the chatbot app only if started
+        if st.session_state.get('chatbot_started', False):
+            chatbot_main()
     
     with tab2:
         st.markdown("### 📊 Visualization Dashboard")
