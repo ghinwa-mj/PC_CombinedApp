@@ -15,13 +15,6 @@ from simple_citation_workflow import process_and_display_citations, display_cita
 import json
 from simple_citation_workflow import display_persistent_citations
 
-
-# Page configuration
-st.set_page_config(
-    page_title="Policy Copilot ChatBot",
-    layout="wide"
-)
-
 def initialize_chatbot_session_state():
     """Initialize all chatbot session state variables"""
     if "messages" not in st.session_state:
@@ -48,6 +41,12 @@ def initialize_chatbot_session_state():
         st.session_state.message_count = 0
     if "chatbot_started" not in st.session_state:
         st.session_state.chatbot_started = False
+
+# Page configuration
+st.set_page_config(
+    page_title="Policy Copilot ChatBot",
+    layout="wide"
+)
 
 # Initialize chatbot components
 def cleanup_weaviate_client():
