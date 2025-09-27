@@ -29,6 +29,8 @@ if "project_context" not in st.session_state:
     st.session_state.project_context = {}
 if "chatbot_initialized" not in st.session_state:
     st.session_state.chatbot_initialized = False
+if "chatbot_components" not in st.session_state:
+    st.session_state.chatbot_components = None
 if "project_defined" not in st.session_state:
     st.session_state.project_defined = False
 if "first_rag_question_asked" not in st.session_state:
@@ -45,6 +47,17 @@ if "message_count" not in st.session_state:
     st.session_state.message_count = 0
 
 # Initialize chatbot components
+def cleanup_weaviate_client():
+    """Clean up Weaviate client connection"""
+    try:
+        chatbot_components = st.session_state.get('chatbot_components', {})
+        client = chatbot_components.get('client')
+        if client:
+            client.close()
+            st.session_state.chatbot_components['client'] = None
+    except Exception as e:
+        st.warning(f"Error closing Weaviate client: {e}")
+
 @st.cache_resource
 def initialize_chatbot():
     """Initialize the chatbot components"""
@@ -511,6 +524,15 @@ def main():
                 st.json(st.session_state.project_context)
             else:
                 st.warning("No project context available yet")
+        
+        # Cleanup button for Weaviate client
+        if st.button("🔧 Cleanup Connections"):
+            cleanup_weaviate_client()
+            st.success("✅ Connections cleaned up!")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # Ensure cleanup happens when the app ends
+        cleanup_weaviate_client()
