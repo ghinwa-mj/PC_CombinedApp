@@ -306,10 +306,13 @@ def get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=10
                 if sector_filter.lower() in doc_sector:
                     filtered_documents.append(doc)
             
-            # Debug output
-            st.info(f"🔍 **Debug Info:** Found {len(documents)} total documents, {len(filtered_documents)} match sector '{sector_filter}'")
-            
-            documents = filtered_documents
+            # User-friendly sector filtering feedback
+            if len(filtered_documents) > 0:
+                st.info(f"🔍 **Searching {sector_filter} documents** - Found relevant sources for your query")
+            else:
+                st.warning(f"⚠️ **No {sector_filter} documents found** - Expanding search to all policy documents")
+                # Fall back to all documents if sector filter yields no results
+                documents = documents  # Keep original documents for broader search
             
             # If no documents match the sector filter, return early
             if not documents:
@@ -366,11 +369,14 @@ def get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=10
         
         final_context = "\n\n".join(context_parts)
         
-        # Debug output for context creation
-        if sector_filter:
-            st.info(f"📚 **Context Created:** {len(context_parts)} document chunks, {current_context_size} tokens, sector filter: '{sector_filter}'")
+        # User-friendly context creation feedback
+        if len(context_parts) > 0:
+            if sector_filter:
+                st.success(f"📚 **Found relevant {sector_filter} sources** - Analyzing {len(context_parts)} policy documents")
+            else:
+                st.success(f"📚 **Found relevant sources** - Analyzing {len(context_parts)} policy documents")
         else:
-            st.info(f"📚 **Context Created:** {len(context_parts)} document chunks, {current_context_size} tokens, no sector filter")
+            st.warning("⚠️ **No relevant sources found** - Please try rephrasing your question")
         
         return final_context
         
@@ -568,3 +574,125 @@ def create_memory_workflow(openai_client, project_context):
     except Exception as e:
         st.error(f"Failed to create memory workflow: {e}")
         return None
+
+
+def generate_auto_intro(project_context):
+    """Generate a brief, cited project introduction using RAG.
+
+    Uses the same Langfuse session as the conversation with a distinct event name.
+    """
+    try:
+        # Get OpenAI client
+        chatbot_components = st.session_state.get('chatbot_components', {})
+        openai = chatbot_components.get('openai')
+        if not openai:
+            return "Error: OpenAI client not initialized."
+
+        # Sector filter based on category
+        category = project_context.get('developmental_outcome_category', 'Other')
+        specific_sectors = ['Stunting', 'Literacy', 'Maternal Deaths', 'Stillbirths', 'Unemployment', 'Neonatal Mortality']
+        sector_filter = category if category in specific_sectors else None
+
+        developmental_outcome = project_context.get('developmental_outcome', 'your developmental outcome')
+        project_summary = project_context.get('project_summary', '')
+
+        # Distilled retrieval query
+        retrieval_query = f"Definition and measurement of {developmental_outcome}. Context: {project_summary}"
+
+        # Build context
+        context = get_rag_context_with_rerank(
+            retrieval_query,
+            initial_limit=200,
+            final_limit=100,
+            sector_filter=sector_filter
+        )
+
+        if context == "No context available - RAG system not properly initialized.":
+            return context
+        if context == "No relevant documents found.":
+            return context
+        if isinstance(context, str) and context.startswith("Error retrieving context:"):
+            return context
+
+        # Prompts (reuse system prompt and enforce same citation rules)
+        system_prompt = create_system_prompt(project_context)
+        intro_prompt = f"""Based on this project information: {project_context}, create a brief introduction to the user where you
+1) Start with explaining the main definition of {developmental_outcome} found in the literarure (2-3 sentences max)
+2) Continue with the main method of measuring {developmental_outcome} (2-3 sentences max)
+3) Add any contextual considerations based on the specific information the user provides.
+
+- IMPORTANT: You MUST cite your sources. For every piece of information you provide, include a citation in this EXACT format: (Author, Year) [Chunk Number] - Ex: (ILO, 2025) [43]
+        - Use ONLY the chunk NUMBERS provided in the context. Do not attach text to it. Each document chunk has a Chunk Index field showing its number.
+        - For multiple citations, use: (Author, Year) [Chunk Number] (Author, Year) [Chunk Number]
+        - Do NOT use any other citation format. Do NOT use "Chunk X" or (Chunk Number 5) in parentheses. Use ONLY the format specified above. 
+        - If there is no information available in the literature, do not make up information. Simply state that the information is not available in the literature and prompt the user to change the question to a topic that is more suitable for the literature.
+        - Do not respond to any unrelated questions.
+
+Context:
+{context}
+"""
+
+        # Call model with same Langfuse session, distinct event name
+        llm_start_time = time.time()
+        answer = openai.chat.completions.create(
+            name="auto_intro_generation",
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": intro_prompt}
+            ],
+            temperature=0,
+            metadata={
+                "langfuse_session_id": st.session_state.get("conversation_id"),
+                "task": "auto_intro",
+                "sector_filter": sector_filter,
+                "context_length": len(context),
+                "system_prompt": truncate_prompt(system_prompt),
+                "system_prompt_length": len(system_prompt),
+                "user_prompt": truncate_prompt(intro_prompt),
+                "user_prompt_length": len(intro_prompt)
+            }
+        )
+        llm_end_time = time.time()
+
+        response_text = answer.choices[0].message.content
+
+        # Track generation and performance in Langfuse
+        if st.session_state.get('langfuse_trace'):
+            execution_time = llm_end_time - llm_start_time
+            track_llm_call(
+                trace=st.session_state.langfuse_trace,
+                name="auto_intro_generation",
+                model="gpt-4o-mini",
+                input_text=retrieval_query,
+                output_text=response_text,
+                usage={
+                    "prompt_tokens": answer.usage.prompt_tokens,
+                    "completion_tokens": answer.usage.completion_tokens,
+                    "total_tokens": answer.usage.total_tokens
+                },
+                metadata={
+                    "task": "auto_intro",
+                    "sector_filter": sector_filter,
+                    "context_length": len(context),
+                    "langfuse_session_id": st.session_state.get("conversation_id")
+                },
+                execution_time=execution_time
+            )
+
+            track_performance(
+                trace=st.session_state.langfuse_trace,
+                operation_name="auto_intro_generation",
+                execution_time=execution_time,
+                metadata={"response_length": len(response_text)}
+            )
+
+        return response_text
+
+    except Exception as e:
+        if st.session_state.get('langfuse_trace'):
+            track_error(st.session_state.langfuse_trace, e, {
+                "operation": "generate_auto_intro",
+                "project_context": project_context
+            })
+        return f"Error generating project introduction: {str(e)}"

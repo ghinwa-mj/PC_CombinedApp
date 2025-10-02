@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
 from langchain_openai import ChatOpenAI
 import uuid
-from rag_workflow import run_query, handle_memory_chat_query, get_rag_context_with_rerank
+from rag_workflow import run_query, handle_memory_chat_query, get_rag_context_with_rerank, generate_auto_intro
 from simple_citation_workflow import process_and_display_citations, display_citation_expanders, parse_citations_from_response, extract_chunk_numbers, get_chunk_data_from_weaviate, create_citation_mapping
 import json
 from simple_citation_workflow import display_persistent_citations
@@ -69,6 +69,13 @@ def initialize_chatbot_session_state():
     # One-time prompt logging flag
     if "rag_prompts_logged" not in st.session_state:
         st.session_state.rag_prompts_logged = False
+    # Auto-intro state flags
+    if "auto_intro_started" not in st.session_state:
+        st.session_state.auto_intro_started = False
+    if "auto_intro_generated" not in st.session_state:
+        st.session_state.auto_intro_generated = False
+    if "project_intro_text" not in st.session_state:
+        st.session_state.project_intro_text = ""
 
 # Page configuration is handled in main_app.py
 
@@ -344,6 +351,11 @@ def display_confirmation_ui(project_info):
                 st.session_state.awaiting_confirmation = False
                 st.session_state.pending_project_info = {}
                 
+                # Prepare auto-intro generation
+                st.session_state.auto_intro_started = True
+                st.session_state.auto_intro_generated = False
+                st.session_state.project_intro_text = ""
+                
                 # Add confirmation message to chat
                 outcome_display = other_explanation.strip() if selected_category == "Other" else selected_category
                 confirmation_message = f"""
@@ -433,6 +445,19 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
     
+    # Auto-generate project introduction (gates chat until done)
+    if st.session_state.project_defined and not st.session_state.get("auto_intro_generated", False):
+        with st.chat_message("assistant"):
+            st.markdown("### 📘 Project Introduction")
+            with st.spinner("Preparing a brief introduction from the literature..."):
+                intro = generate_auto_intro(st.session_state.project_context)
+        # Store, append, and flag for citations
+        st.session_state.project_intro_text = intro
+        st.session_state.messages.append({"role": "assistant", "content": f"### 📘 Project Introduction\n\n{intro}"})
+        st.session_state.first_rag_question_asked = True
+        st.session_state.auto_intro_generated = True
+        st.rerun()
+    
     # Display citations for the last RAG response (persistent across refreshes)
     if (st.session_state.project_defined and 
         st.session_state.first_rag_question_asked and 
@@ -461,84 +486,91 @@ def main():
     # Chat input - dynamic placeholder based on project status
     chat_placeholder = "Ask me about your project..." if st.session_state.project_defined else "Describe your developmental project..."
     
-    if prompt := st.chat_input(chat_placeholder):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Generate response
-        with st.chat_message("assistant"):
-            rag_context = ""  # Initialize rag_context for all responses
-            if st.session_state.project_defined:
-                # Memory-enabled RAG mode - handle questions about the defined project
-                with st.spinner("Searching through policy documents..."):
-                    # Initialize Langfuse trace if not exists
-                    if not st.session_state.langfuse_trace:
-                        st.session_state.langfuse_trace = create_conversation_trace(
-                            session_id=st.session_state.conversation_id,
-                            metadata={"app": "policy_copilot", "mode": "rag_query"}
-                        )
-                    
-                    # Track RAG query performance
-                    start_time = time.time()
-                    st.session_state.first_rag_question_asked = True
-                    response = handle_memory_chat_query(prompt, st.session_state.project_context)
-                    end_time = time.time()
-                    
-                    # Track RAG performance in Langfuse
-                    track_performance(
-                        trace=st.session_state.langfuse_trace,
-                        operation_name="rag_query",
-                        execution_time=end_time - start_time,
-                        metadata={
-                            "project_context": st.session_state.project_context,
-                            "response_length": len(response)
-                        }
-                    )
-                    
-            else:
-                # Project definition mode
-                with st.spinner("Analyzing your project description..."):
-                    # Extract project information
-                    project_info = extract_project_info(prompt)
-                    
-                    if project_info:
-                        # Check if project is relevant
-                        if not project_info.get('is_relevant', False):
-                            response = generate_follow_up_prompt([], False)
-                        else:
-                            # Check for missing information
-                            missing_info = project_info.get('missing_info', [])
-                            
-                            if not missing_info:
-                                # All information captured - show confirmation UI
-                                st.session_state.awaiting_confirmation = True
-                                st.session_state.pending_project_info = project_info
-                                
-                                response = generate_project_summary(project_info)
-                                response += "\n\n✅ **I've extracted your project information!**\n\n"
-                                response += "**Please review and edit the information below before we proceed.**"
-                            else:
-                                # Missing information
-                                response = generate_follow_up_prompt(missing_info, True)
-                    else:
-                        response = "I'm having trouble processing your project description. Please try again with a clear description of your developmental project."
+    # Gate chat input until intro is generated
+    chat_enabled = (not st.session_state.project_defined) or st.session_state.get("auto_intro_generated", False)
+    
+    if chat_enabled:
+        if prompt := st.chat_input(chat_placeholder):
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": prompt})
             
-            # Display the response in the chat message
-            st.markdown(response)
-        
-        # Add assistant response to chat history (only if not awaiting confirmation)
-        if not st.session_state.awaiting_confirmation:
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            # Increment message count for citation tracking
-            st.session_state.message_count += 1
-            # Rerun to show the new message in conversation history
-            st.rerun()
+            # Generate response
+            with st.chat_message("assistant"):
+                rag_context = ""  # Initialize rag_context for all responses
+                if st.session_state.project_defined:
+                    # Memory-enabled RAG mode - handle questions about the defined project
+                    with st.spinner("Searching through policy documents..."):
+                        # Initialize Langfuse trace if not exists
+                        if not st.session_state.langfuse_trace:
+                            st.session_state.langfuse_trace = create_conversation_trace(
+                                session_id=st.session_state.conversation_id,
+                                metadata={"app": "policy_copilot", "mode": "rag_query"}
+                            )
+                        
+                        # Track RAG query performance
+                        start_time = time.time()
+                        st.session_state.first_rag_question_asked = True
+                        response = handle_memory_chat_query(prompt, st.session_state.project_context)
+                        end_time = time.time()
+                        
+                        # Track RAG performance in Langfuse
+                        track_performance(
+                            trace=st.session_state.langfuse_trace,
+                            operation_name="rag_query",
+                            execution_time=end_time - start_time,
+                            metadata={
+                                "project_context": st.session_state.project_context,
+                                "response_length": len(response)
+                            }
+                        )
+                        
+                else:
+                    # Project definition mode
+                    with st.spinner("Analyzing your project description..."):
+                        # Extract project information
+                        project_info = extract_project_info(prompt)
+                        
+                        if project_info:
+                            # Check if project is relevant
+                            if not project_info.get('is_relevant', False):
+                                response = generate_follow_up_prompt([], False)
+                            else:
+                                # Check for missing information
+                                missing_info = project_info.get('missing_info', [])
+                                
+                                if not missing_info:
+                                    # All information captured - show confirmation UI
+                                    st.session_state.awaiting_confirmation = True
+                                    st.session_state.pending_project_info = project_info
+                                    
+                                    response = generate_project_summary(project_info)
+                                    response += "\n\n✅ **I've extracted your project information!**\n\n"
+                                    response += "**Please review and edit the information below before we proceed.**"
+                                else:
+                                    # Missing information
+                                    response = generate_follow_up_prompt(missing_info, True)
+                        else:
+                            response = "I'm having trouble processing your project description. Please try again with a clear description of your developmental project."
+                
+                # Display the response in the chat message
+                st.markdown(response)
+            
+            # Add assistant response to chat history (only if not awaiting confirmation)
+            if not st.session_state.awaiting_confirmation:
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                # Increment message count for citation tracking
+                st.session_state.message_count += 1
+                # Rerun to show the new message in conversation history
+                st.rerun()
 
-        # If we're awaiting confirmation, add response to messages and return
-        if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
-            return
+            # If we're awaiting confirmation, add response to messages and return
+            if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
+                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.rerun()
+                return
+    else:
+        st.info("⏳ Generating your project introduction...")
+        return
     
     # Sidebar with project context
     with st.sidebar:
@@ -595,6 +627,10 @@ def main():
             st.session_state.conversation_id = str(uuid.uuid4())
             # Reset one-time RAG prompt logging
             st.session_state.rag_prompts_logged = False
+            # Reset auto-intro state
+            st.session_state.auto_intro_started = False
+            st.session_state.auto_intro_generated = False
+            st.session_state.project_intro_text = ""
             st.rerun()
         
         if st.button("⏹️ Stop Chat"):
@@ -613,6 +649,14 @@ def main():
             st.session_state.chatbot_started = False
             cleanup_weaviate_client()
             st.rerun()
+        
+        # Regenerate intro button
+        if st.session_state.project_defined:
+            if st.button("🔁 Regenerate Intro"):
+                st.session_state.auto_intro_started = True
+                st.session_state.auto_intro_generated = False
+                st.session_state.project_intro_text = ""
+                st.rerun()
         
         # Clear citations button
         if st.session_state.get('all_citations'):

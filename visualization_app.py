@@ -19,6 +19,13 @@ OUTCOME_INDICATORS = {
         "display_name": "Unemployment Rate",
         "unit": "%"
     },
+    "Youth Unemployment": {
+        "total": "youth_unemployment_rate_percentage_total",
+        "female": "youth_unemployment_rate_percentage_female",
+        "male": "youth_unemployment_rate_percentage_male",
+        "display_name": "Youth Unemployment Rate",
+        "unit": "%"
+    },
     "Youth not in Education or Training": {
         "total": "youth_notin_education_employment_training_total",
         "female": "youth_notin_education_employment_training_female",
@@ -88,8 +95,7 @@ OUTCOME_INDICATORS = {
         "male": None,    # No gender breakdown available
         "display_name": "Adolescent Pregnancies",
         "unit": "births per 1,000 women aged 15-19"
-    }
-}
+    }}
 
 # Define segmentation options for each indicator
 SEGMENTATION_OPTIONS = {
@@ -111,6 +117,14 @@ SEGMENTATION_OPTIONS = {
             "total": "youth_notin_education_employment_training_total",
             "female": "youth_notin_education_employment_training_female",
             "male": "youth_notin_education_employment_training_male",
+            "labels": ["Total", "Female", "Male"]
+        }
+    },
+    "Youth Unemployment": {
+        "Gender": {
+            "total": "youth_unemployment_rate_percentage_total",
+            "female": "youth_unemployment_rate_percentage_female",
+            "male": "youth_unemployment_rate_percentage_male",
             "labels": ["Total", "Female", "Male"]
         }
     },
@@ -298,9 +312,125 @@ def get_countries_with_data(df, indicator_name):
     countries_with_data = df[df[total_column].notna()]['country'].unique()
     return sorted(countries_with_data)
 
+def reduce_data_for_ai(data_json, max_records=30, analysis_type="time_trend"):
+    """Reduce data size for AI analysis by sampling intelligently"""
+    try:
+        import json
+        
+        # Parse the JSON data
+        if isinstance(data_json, str):
+            data = json.loads(data_json)
+        else:
+            data = data_json
+        
+        if not isinstance(data, list):
+            return data_json
+        
+        # If data is small enough, return as is
+        if len(data) <= max_records:
+            return data_json
+        
+        # For large datasets, sample intelligently based on analysis type
+        if len(data) > max_records:
+            # Sort by year if year column exists
+            if isinstance(data[0], dict) and 'year' in data[0]:
+                data = sorted(data, key=lambda x: x.get('year', 0))
+            
+            sampled_data = []
+            
+            if analysis_type == "time_trend":
+                # For time trends, focus on key years: start, middle, recent
+                if len(data) <= max_records:
+                    sampled_data = data
+                else:
+                    # Take first, middle, and last records with some intermediate samples
+                    step = max(1, len(data) // max_records)
+                    
+                    # Always include first record
+                    sampled_data.append(data[0])
+                    
+                    # Sample middle records
+                    for i in range(step, len(data) - step, step):
+                        sampled_data.append(data[i])
+                    
+                    # Always include last record
+                    if len(data) > 1:
+                        sampled_data.append(data[-1])
+                    
+                    # Ensure we don't exceed max_records
+                    if len(sampled_data) > max_records:
+                        sampled_data = sampled_data[:max_records]
+            
+            elif analysis_type in ["comparison", "peer_comparison"]:
+                # For comparisons, ensure we have data for all countries
+                if isinstance(data[0], dict) and 'country' in data[0]:
+                    # Group by country and sample from each
+                    countries = {}
+                    for record in data:
+                        country = record.get('country', 'Unknown')
+                        if country not in countries:
+                            countries[country] = []
+                        countries[country].append(record)
+                    
+                    # Sample from each country
+                    records_per_country = max(1, max_records // len(countries))
+                    for country_data in countries.values():
+                        if len(country_data) <= records_per_country:
+                            sampled_data.extend(country_data)
+                        else:
+                            # Sample evenly from this country's data
+                            step = len(country_data) // records_per_country
+                            for i in range(0, len(country_data), step):
+                                sampled_data.append(country_data[i])
+                                if len(sampled_data) >= max_records:
+                                    break
+                        if len(sampled_data) >= max_records:
+                            break
+                else:
+                    # Fallback to general sampling
+                    step = len(data) // max_records
+                    sampled_data = [data[i] for i in range(0, len(data), step)][:max_records]
+            
+            else:
+                # General sampling for other analysis types
+                step = len(data) // max_records
+                if step < 1:
+                    step = 1
+                
+                # Always include first and last records
+                sampled_data.append(data[0])
+                if len(data) > 1:
+                    sampled_data.append(data[-1])
+                
+                # Sample middle records
+                for i in range(step, len(data) - step, step):
+                    sampled_data.append(data[i])
+                    if len(sampled_data) >= max_records:
+                        break
+                
+                # Ensure we don't exceed max_records
+                if len(sampled_data) > max_records:
+                    sampled_data = sampled_data[:max_records]
+            
+            return json.dumps(sampled_data)
+        
+        return data_json
+        
+    except Exception as e:
+        # If reduction fails, return original data
+        return data_json
+
 def generate_insights(data_json, indicator_name, country_name=None, countries_list=None, analysis_type="time_trend"):
     """Generate insights using OpenAI GPT-4o based on the visualization data"""
     try:
+        # Reduce data size for AI analysis
+        reduced_data_json = reduce_data_for_ai(data_json, max_records=30, analysis_type=analysis_type)
+        
+        # Check if the reduced data is still too large (rough estimate)
+        if len(reduced_data_json) > 50000:  # Rough token estimate
+            # Try more aggressive reduction
+            reduced_data_json = reduce_data_for_ai(data_json, max_records=15, analysis_type=analysis_type)
+        
         # Initialize OpenAI client
         client = OpenAI(api_key=apikeys.OPENAI_API_KEY)
         
@@ -327,15 +457,15 @@ def generate_insights(data_json, indicator_name, country_name=None, countries_li
 
 Context: {context}
 
-Data (JSON format):
-{data_json}
+Data (JSON format - sampled for analysis):
+{reduced_data_json}
 
-Please provide a 3-5 bullet point summary about th ekey trends shown in this data. Explain these trends within the context of what we know about {display_name} in {country_name if country_name else 'the selected countries'}. Focus on:
+Please provide a 3-5 bullet point summary about the key trends shown in this data. Explain these trends within the context of what we know about {display_name} in {country_name if country_name else 'the selected countries'}. Focus on:
 1. Key patterns and trends
 2. Notable changes over time
 3. Contextual insights about what these trends might indicate
 4. Do not provide any policy advice or recommendations yourself. 
-5. Do not be vague and make sure that you support every arguement you make with the data and evidence in front of you.
+5. Do not be vague and make sure that you support every argument you make with the data and evidence in front of you.
 Keep the response concise, professional, and accessible to policy makers."""
         
         # Prepare metadata for Sessions tracking
@@ -444,6 +574,9 @@ def create_time_trend_chart(df, selected_country, indicator_name):
     
     # Sort by year
     country_data = country_data.sort_values('year')
+    
+    # Deduplicate by year (keep first occurrence for each year)
+    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
     
     # Check if we have multiple years
     years = country_data['year'].unique()
@@ -579,6 +712,9 @@ def create_segmented_trend_chart(df, selected_country, segmentation_type, indica
     
     # Sort by year
     country_data = country_data.sort_values('year')
+    
+    # Deduplicate by year (keep first occurrence for each year)
+    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
     
     # Ensure all indicator columns are numeric
     columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
@@ -773,6 +909,9 @@ def create_country_comparison_chart(df, selected_countries, indicator_name):
     
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
+    
+    # Deduplicate by year and country (keep first occurrence for each year-country combination)
+    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
     
     # Create the chart
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -1015,6 +1154,9 @@ def create_global_benchmarking_chart(df, selected_country, indicator_name):
     # Sort by year
     country_data = country_data.sort_values('year')
     
+    # Deduplicate by year (keep first occurrence for each year)
+    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    
     # Filter averages to only include years where the country has data
     country_years = set(country_data['year'].unique())
     global_averages = global_averages[global_averages['year'].isin(country_years)]
@@ -1204,6 +1346,10 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
     
     # Sort by year and get last 3 years
     country_data = country_data.sort_values('year')
+    
+    # Deduplicate by year (keep first occurrence for each year)
+    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    
     last_3_years_data = country_data.tail(3)
     
     if last_3_years_data.empty:
@@ -1446,6 +1592,22 @@ def create_regional_comparison_chart(df, selected_country, indicator_name):
     plt.tight_layout()
     return fig
 
+def get_country_color_mapping(countries_with_data, selected_country):
+    """Create consistent color mapping for countries"""
+    # Define color palette
+    color_palette = ['#e74c3c', '#667eea', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c', '#34495e', '#e67e22']
+    markers = ['o', 's', '^', 'D', 'v', 'p', 'h', '8']
+    
+    # Create color mapping
+    color_mapping = {}
+    marker_mapping = {}
+    
+    for i, country in enumerate(countries_with_data):
+        color_mapping[country] = color_palette[i % len(color_palette)]
+        marker_mapping[country] = markers[i % len(markers)]
+    
+    return color_mapping, marker_mapping
+
 def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     """Create peer country comparison chart for selected country and its peer countries"""
     if df is None or selected_country is None or indicator_name is None:
@@ -1503,6 +1665,9 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
     
+    # Deduplicate by year and country (keep first occurrence for each year-country combination)
+    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
+    
     # Filter out countries that don't have any valid data for this indicator
     countries_with_data = []
     for country in all_countries:
@@ -1523,15 +1688,14 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     # Reorder countries_with_data to put selected country first
     countries_with_data = [selected_country] + [c for c in countries_with_data if c != selected_country]
     
+    # Get consistent color and marker mapping
+    color_mapping, marker_mapping = get_country_color_mapping(countries_with_data, selected_country)
+    
     # Create the chart
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # Define colors and markers for countries - selected country gets bold red
-    colors = ['#e74c3c', '#667eea', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']  # Bold red for selected country
-    markers = ['o', 's', '^', 'D', 'v', 'p']
-    
-    # Plot lines for each country
-    for i, country in enumerate(countries_with_data):
+    # Plot lines for each country using consistent color mapping
+    for country in countries_with_data:
         country_data = comparison_data[comparison_data['country'] == country].sort_values('year')
         if not country_data.empty:
             # Make selected country line thicker and more prominent
@@ -1540,8 +1704,8 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
             alpha = 1.0 if country == selected_country else 0.9
             
             ax.plot(country_data['year'], country_data[total_column], 
-                   marker=markers[i % len(markers)], linewidth=linewidth, markersize=markersize, 
-                   color=colors[i], markerfacecolor=colors[i], 
+                   marker=marker_mapping[country], linewidth=linewidth, markersize=markersize, 
+                   color=color_mapping[country], markerfacecolor=color_mapping[country], 
                    markeredgecolor='white', markeredgewidth=1,
                    label=country, alpha=alpha)
     
@@ -1590,7 +1754,7 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
         country_data = comparison_data[comparison_data['country'] == country]
         dataset_values.extend(country_data[total_column].tolist())
     
-    for i, country in enumerate(countries_with_data):
+    for country in countries_with_data:
         country_data = comparison_data[comparison_data['country'] == country].sort_values('year')
         if not country_data.empty:
             data_points = list(zip(country_data['year'], country_data[total_column]))
@@ -1602,7 +1766,7 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
                     if annotation_text is not None:
                         ax.annotate(annotation_text, (year, value), 
                                    textcoords="offset points", xytext=(0,10), ha='center',
-                                   fontsize=8, fontweight='bold', color=colors[i])
+                                   fontsize=8, fontweight='bold', color=color_mapping[country])
             else:
                 # Annotate all points if less than 11
                 for year, value in data_points:
@@ -1610,7 +1774,7 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
                     if annotation_text is not None:
                         ax.annotate(annotation_text, (year, value), 
                                    textcoords="offset points", xytext=(0,10), ha='center',
-                                   fontsize=8, fontweight='bold', color=colors[i])
+                                   fontsize=8, fontweight='bold', color=color_mapping[country])
     
     # Set y-axis limits
     all_values = []
@@ -1649,6 +1813,9 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     display_name = indicator["display_name"]
     unit = indicator["unit"]
     
+    # Get consistent color mapping (same as line chart)
+    color_mapping, _ = get_country_color_mapping(countries_with_data, selected_country)
+    
     # Filter data for countries with data
     comparison_data = df[df['country'].isin(countries_with_data)].copy()
     
@@ -1658,6 +1825,9 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     
     # Remove rows with NaN values for the indicator
     comparison_data = comparison_data.dropna(subset=[total_column])
+    
+    # Deduplicate by year and country (keep first occurrence for each year-country combination)
+    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
     
     if comparison_data.empty:
         return None
@@ -1706,16 +1876,8 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     countries = latest_year_data['country'].tolist()
     values = latest_year_data[total_column].tolist()
     
-    # Create color list (bold red for selected country, others in different colors)
-    colors = ['#e74c3c', '#667eea', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
-    bar_colors = []
-    
-    # Assign colors based on country position, but make selected country always red
-    for i, country in enumerate(countries):
-        if country == selected_country:
-            bar_colors.append('#e74c3c')  # Bold red for selected country
-        else:
-            bar_colors.append(colors[(i + 1) % len(colors)])  # Other colors for peers
+    # Use consistent color mapping from line chart
+    bar_colors = [color_mapping[country] for country in countries]
     
     # Create bars
     bars = ax.bar(countries, values, color=bar_colors, alpha=0.8, 
@@ -1834,7 +1996,10 @@ def main():
                         if st.button("🤖 Generate Insights", key="insights_time_trend", type="secondary"):
                             with st.spinner("Generating insights..."):
                                 # Prepare data for AI analysis
-                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                country_data = df[df['country'] == selected_country].copy()
+                                # Ensure year column is numeric before sorting
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data = country_data.sort_values('year')
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                 total_column = indicator_info['total']
                                 
@@ -1855,7 +2020,10 @@ def main():
                                 st.info(insights)
                         
                         # Show data summary
-                        country_data = df[df['country'] == selected_country].sort_values('year')
+                        country_data = df[df['country'] == selected_country].copy()
+                        # Ensure year column is numeric before sorting
+                        country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                        country_data = country_data.sort_values('year')
                         st.markdown("### 📈 Data Summary")
                         
                         col1, col2, col3 = st.columns(3)
@@ -1990,7 +2158,10 @@ def main():
                             if st.button("🤖 Generate Insights", key="insights_segmented", type="secondary"):
                                 with st.spinner("Generating insights..."):
                                     # Prepare data for AI analysis
-                                    country_data = df[df['country'] == selected_country].sort_values('year')
+                                    country_data = df[df['country'] == selected_country].copy()
+                                    # Ensure year column is numeric before sorting
+                                    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                    country_data = country_data.sort_values('year')
                                     indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                     segmentation_config = segmentation_options[segmentation_type]
                                     
@@ -2015,7 +2186,10 @@ def main():
                                     st.info(insights)
                             
                             # Show raw data
-                            country_data = df[df['country'] == selected_country].sort_values('year')
+                            country_data = df[df['country'] == selected_country].copy()
+                            # Ensure year column is numeric before sorting
+                            country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                            country_data = country_data.sort_values('year')
                             indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                             segmentation_config = segmentation_options[segmentation_type]
                             
@@ -2136,7 +2310,10 @@ def main():
                         cols = st.columns(len(selected_countries))
                         for i, country in enumerate(selected_countries):
                             with cols[i]:
-                                country_data = df[df['country'] == country].sort_values('year')
+                                country_data = df[df['country'] == country].copy()
+                                # Ensure year column is numeric before sorting
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data = country_data.sort_values('year')
                                 valid_data = country_data.dropna(subset=[total_column])
                                 
                                 if not valid_data.empty:
@@ -2228,7 +2405,10 @@ def main():
                         if st.button("🤖 Generate Insights", key="insights_benchmarking", type="secondary"):
                             with st.spinner("Generating insights..."):
                                 # Prepare data for AI analysis
-                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                country_data = df[df['country'] == selected_country].copy()
+                                # Ensure year column is numeric before sorting
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data = country_data.sort_values('year')
                                 global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                 total_column = indicator_info['total']
@@ -2273,14 +2453,16 @@ def main():
                         if st.button("🤖 Generate Insights", key="insights_bar_chart", type="secondary"):
                             with st.spinner("Generating insights..."):
                                 # Prepare data for AI analysis (last 3 years)
-                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                country_data = df[df['country'] == selected_country].copy()
+                                # Ensure year column is numeric before sorting
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
+                                country_data = country_data.sort_values('year')
                                 global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                 total_column = indicator_info['total']
                                 
                                 # Get last 3 years data
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
-                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
                                 last_3_years_data = country_data.dropna(subset=[total_column]).tail(3)
                                 
                                 if not last_3_years_data.empty and global_averages is not None:
@@ -2328,13 +2510,15 @@ def main():
                         if st.button("🤖 Generate Insights", key="insights_regional_chart", type="secondary"):
                             with st.spinner("Generating insights..."):
                                 # Prepare data for AI analysis (regional comparison)
-                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                country_data = df[df['country'] == selected_country].copy()
+                                # Ensure year column is numeric before sorting
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
+                                country_data = country_data.sort_values('year')
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                 total_column = indicator_info['total']
                                 
                                 # Get the latest year with data for the selected country
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
-                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
                                 latest_year = country_data.dropna(subset=[total_column])['year'].max()
                                 
                                 # Get regional data for the latest year
@@ -2382,7 +2566,10 @@ def main():
                         st.markdown("### 📈 Benchmarking Summary")
                         
                         # Get country data and global averages
-                        country_data = df[df['country'] == selected_country].sort_values('year')
+                        country_data = df[df['country'] == selected_country].copy()
+                        # Ensure year column is numeric before sorting
+                        country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                        country_data = country_data.sort_values('year')
                         global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
                         
                         indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
@@ -2640,7 +2827,10 @@ def main():
                             cols = st.columns(len(countries_with_data))
                             for i, country in enumerate(countries_with_data):
                                 with cols[i]:
-                                    country_data = df[df['country'] == country].sort_values('year')
+                                    country_data = df[df['country'] == country].copy()
+                                    # Ensure year column is numeric before sorting
+                                    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                    country_data = country_data.sort_values('year')
                                     valid_data = country_data.dropna(subset=[total_column])
                                     
                                     if not valid_data.empty:
