@@ -501,6 +501,49 @@ Keep the response concise, professional, and accessible to policy makers."""
     except Exception as e:
         return f"Error generating insights: {str(e)}"
 
+def smart_deduplicate_segmentation_data(df, segmentation_columns):
+    """
+    Smart deduplication for segmentation data.
+    For each year, keep the record with the most complete segmentation data.
+    """
+    if df.empty:
+        return df
+    
+    # Group by year and find the best record for each year
+    deduplicated_data = []
+    
+    for year in df['year'].unique():
+        year_data = df[df['year'] == year]
+        
+        if len(year_data) == 1:
+            # Only one record for this year, keep it
+            deduplicated_data.append(year_data.iloc[0])
+        else:
+            # Multiple records for this year, choose the best one
+            best_record = None
+            best_score = -1
+            
+            for idx, record in year_data.iterrows():
+                # Score based on number of non-null segmentation values
+                score = 0
+                for col in segmentation_columns:
+                    if col in record and not pd.isna(record[col]):
+                        score += 1
+                
+                # If this record has a better score, or same score but more recent (higher index)
+                if score > best_score or (score == best_score and idx > best_record.name if best_record is not None else True):
+                    best_record = record
+                    best_score = score
+            
+            if best_record is not None:
+                deduplicated_data.append(best_record)
+    
+    # Convert back to DataFrame
+    if deduplicated_data:
+        return pd.DataFrame(deduplicated_data)
+    else:
+        return df.iloc[0:0]  # Return empty DataFrame with same structure
+
 def format_annotation_value(value, dataset_values):
     """Format annotation value based on dataset characteristics"""
     if pd.isna(value):
@@ -710,17 +753,47 @@ def create_segmented_trend_chart(df, selected_country, segmentation_type, indica
     # Ensure year column is numeric
     country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
     
+    # Get segmentation columns for validation and processing
+    columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
+    segmentation_columns = list(columns.values())
+    
+    # Validate that segmentation columns exist in the dataset
+    missing_columns = [col for col in segmentation_columns if col not in country_data.columns]
+    if missing_columns:
+        st.warning(f"⚠️ Missing segmentation columns in dataset: {missing_columns}")
+        st.info("The following segmentation columns are not available in the dataset. Please check your data or select a different segmentation type.")
+        return None
+    
+    # Ensure all indicator columns are numeric
+    for column in segmentation_columns:
+        if column in country_data.columns:
+            country_data[column] = pd.to_numeric(country_data[column], errors='coerce')
+    
     # Sort by year
     country_data = country_data.sort_values('year')
     
-    # Deduplicate by year (keep first occurrence for each year)
-    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    # Smart deduplication: keep the record with the most complete segmentation data for each year
+    original_count = len(country_data)
+    country_data = smart_deduplicate_segmentation_data(country_data, segmentation_columns)
+    deduplicated_count = len(country_data)
     
-    # Ensure all indicator columns are numeric
-    columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
-    for column in columns.values():
-        if column in country_data.columns:
-            country_data[column] = pd.to_numeric(country_data[column], errors='coerce')
+    # Calculate data completeness metrics
+    total_years = len(country_data['year'].unique())
+    complete_years = 0
+    for year in country_data['year'].unique():
+        year_data = country_data[country_data['year'] == year]
+        if not year_data.empty:
+            # Check if all segmentation columns have non-null values for this year
+            has_all_data = all(not pd.isna(year_data[col].iloc[0]) for col in segmentation_columns if col in year_data.columns)
+            if has_all_data:
+                complete_years += 1
+    
+    # Show data completeness information
+    if original_count != deduplicated_count:
+        st.info(f"📊 Data Processing: {original_count} records → {deduplicated_count} records (removed {original_count - deduplicated_count} duplicates)")
+    
+    completeness_pct = (complete_years / total_years * 100) if total_years > 0 else 0
+    st.info(f"📈 Data Completeness: {complete_years}/{total_years} years ({completeness_pct:.1f}%) have complete segmentation data")
     
     # Check if we have multiple years
     years = country_data['year'].unique()
@@ -2185,25 +2258,21 @@ def main():
                                     st.markdown("### 🤖 AI-Generated Insights")
                                     st.info(insights)
                             
-                            # Show raw data
-                            country_data = df[df['country'] == selected_country].copy()
-                            # Ensure year column is numeric before sorting
-                            country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
-                            country_data = country_data.sort_values('year')
-                            indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
-                            segmentation_config = segmentation_options[segmentation_type]
-                            
+                            # Show raw data (before processing)
                             with st.expander("View Raw Data"):
+                                # Get segmentation config and columns
+                                segmentation_config = segmentation_options[segmentation_type]
                                 columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
+                                segmentation_columns = list(columns.values())
                                 labels = segmentation_config['labels']
-                                columns_to_show = ['year'] + list(columns.values())
+                                
+                                # Show original raw data without any processing
+                                country_data_original = df[df['country'] == selected_country].copy()
+                                columns_to_show = ['year'] + segmentation_columns
                                 column_names = ['Year'] + labels
                                 
-                                display_data = country_data[columns_to_show].rename(columns=dict(zip(columns_to_show, column_names)))
-                                # Filter out rows where ALL segmentation columns are NA (use renamed column names)
-                                segmentation_cols_renamed = labels  # These are the renamed column names
-                                filtered_data = display_data.dropna(subset=segmentation_cols_renamed, how='all')
-                                st.dataframe(filtered_data)
+                                display_data_original = country_data_original[columns_to_show].rename(columns=dict(zip(columns_to_show, column_names)))
+                                st.dataframe(display_data_original)
                         else:
                             st.warning(f"No valid data available for {selected_country} with {segmentation_type} segmentation.")
                     else:
