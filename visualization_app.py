@@ -501,6 +501,46 @@ Keep the response concise, professional, and accessible to policy makers."""
     except Exception as e:
         return f"Error generating insights: {str(e)}"
 
+def smart_deduplicate_country_data(df, indicator_column):
+    """
+    Smart deduplication for country data.
+    For each year-country combination, keep the record with the most complete data.
+    """
+    if df.empty:
+        return df
+    
+    deduplicated_data = []
+    
+    for (year, country), group in df.groupby(['year', 'country']):
+        if len(group) == 1:
+            # Only one record for this year-country, keep it
+            deduplicated_data.append(group.iloc[0])
+        else:
+            # Multiple records for this year-country, choose the best one
+            best_record = None
+            best_score = -1
+            
+            for idx, record in group.iterrows():
+                # Score based on data completeness (non-null values)
+                score = 0
+                if not pd.isna(record[indicator_column]):
+                    score += 1
+                # Add more scoring criteria if needed
+                
+                # If this record has a better score, or same score but more recent (higher index)
+                if score > best_score or (score == best_score and idx > best_record.name if best_record is not None else True):
+                    best_record = record
+                    best_score = score
+            
+            if best_record is not None:
+                deduplicated_data.append(best_record)
+    
+    # Convert back to DataFrame
+    if deduplicated_data:
+        return pd.DataFrame(deduplicated_data)
+    else:
+        return df.iloc[0:0]  # Return empty DataFrame with same structure
+
 def smart_deduplicate_segmentation_data(df, segmentation_columns):
     """
     Smart deduplication for segmentation data.
@@ -983,8 +1023,8 @@ def create_country_comparison_chart(df, selected_countries, indicator_name):
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
     
-    # Deduplicate by year and country (keep first occurrence for each year-country combination)
-    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
+    # Apply smart deduplication (same as peer country function)
+    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
     
     # Create the chart
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -1738,8 +1778,14 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
     
-    # Deduplicate by year and country (keep first occurrence for each year-country combination)
-    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
+    # Apply smart deduplication
+    original_count = len(comparison_data)
+    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
+    deduplicated_count = len(comparison_data)
+    
+    # Show data processing information
+    if original_count != deduplicated_count:
+        st.info(f"📊 Data Processing: {original_count} records → {deduplicated_count} records (removed {original_count - deduplicated_count} duplicates)")
     
     # Filter out countries that don't have any valid data for this indicator
     countries_with_data = []
@@ -1760,6 +1806,11 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     
     # Reorder countries_with_data to put selected country first
     countries_with_data = [selected_country] + [c for c in countries_with_data if c != selected_country]
+    
+    # Show data completeness information
+    total_countries = len(all_countries)
+    countries_with_data_count = len(countries_with_data)
+    st.info(f"📈 Data Availability: {countries_with_data_count}/{total_countries} countries have data for {indicator_name}")
     
     # Get consistent color and marker mapping
     color_mapping, marker_mapping = get_country_color_mapping(countries_with_data, selected_country)
@@ -1896,11 +1947,11 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
     comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
     
-    # Remove rows with NaN values for the indicator
-    comparison_data = comparison_data.dropna(subset=[total_column])
+    # Don't remove NaN values - we'll handle them in visualization
+    # comparison_data = comparison_data.dropna(subset=[total_column])  # Removed this line
     
-    # Deduplicate by year and country (keep first occurrence for each year-country combination)
-    comparison_data = comparison_data.drop_duplicates(subset=['year', 'country'], keep='first')
+    # Apply smart deduplication (same as line chart)
+    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
     
     if comparison_data.empty:
         return None
@@ -1916,25 +1967,36 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     if not country_latest_years:
         return None
     
-    # Find the latest year where all countries have data
-    # We need to find a year where ALL countries have data
+    # Find the latest year where we have data for the most countries
+    # Instead of requiring ALL countries, find the year with the most countries
     all_years = sorted(comparison_data['year'].unique(), reverse=True)  # Start from latest
     
-    latest_common_year = None
+    best_year = None
+    max_countries = 0
+    
     for year in all_years:
         year_data = comparison_data[comparison_data['year'] == year]
-        countries_in_year = year_data['country'].unique()
+        # Only count countries that have non-null data for this year
+        countries_with_data_this_year = year_data[year_data[total_column].notna()]['country'].unique()
+        country_count = len(countries_with_data_this_year)
         
-        # Check if all countries_with_data are present in this year
-        if all(country in countries_in_year for country in countries_with_data):
-            latest_common_year = year
-            break
+        if country_count > max_countries:
+            max_countries = country_count
+            best_year = year
     
-    if latest_common_year is None:
+    if best_year is None or max_countries == 0:
         return None
+    
+    latest_common_year = best_year
     
     # Get data for the latest common year
     latest_year_data = comparison_data[comparison_data['year'] == latest_common_year].copy()
+    
+    if latest_year_data.empty:
+        return None
+    
+    # Filter to only include countries with valid data for this year
+    latest_year_data = latest_year_data[latest_year_data[total_column].notna()]
     
     if latest_year_data.empty:
         return None
@@ -2258,21 +2320,43 @@ def main():
                                     st.markdown("### 🤖 AI-Generated Insights")
                                     st.info(insights)
                             
-                            # Show raw data (before processing)
+                            # Show raw data (same as visualization data)
                             with st.expander("View Raw Data"):
+                                # Get the same data that was used for the visualization
+                                country_data_raw = df[df['country'] == selected_country].copy()
+                                country_data_raw['year'] = pd.to_numeric(country_data_raw['year'], errors='coerce')
+                                
                                 # Get segmentation config and columns
                                 segmentation_config = segmentation_options[segmentation_type]
                                 columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
                                 segmentation_columns = list(columns.values())
                                 labels = segmentation_config['labels']
                                 
-                                # Show original raw data without any processing
-                                country_data_original = df[df['country'] == selected_country].copy()
+                                # Ensure all indicator columns are numeric
+                                for column in segmentation_columns:
+                                    if column in country_data_raw.columns:
+                                        country_data_raw[column] = pd.to_numeric(country_data_raw[column], errors='coerce')
+                                
+                                # Sort by year
+                                country_data_raw = country_data_raw.sort_values('year')
+                                
+                                # Apply smart deduplication (same as visualization)
+                                country_data_raw = smart_deduplicate_segmentation_data(country_data_raw, segmentation_columns)
+                                
+                                # Show only non-NA data
                                 columns_to_show = ['year'] + segmentation_columns
                                 column_names = ['Year'] + labels
                                 
-                                display_data_original = country_data_original[columns_to_show].rename(columns=dict(zip(columns_to_show, column_names)))
-                                st.dataframe(display_data_original)
+                                display_data = country_data_raw[columns_to_show].rename(columns=dict(zip(columns_to_show, column_names)))
+                                
+                                # Filter out rows where ALL segmentation columns are NA
+                                segmentation_cols_renamed = labels
+                                filtered_data = display_data.dropna(subset=segmentation_cols_renamed, how='all')
+                                
+                                if not filtered_data.empty:
+                                    st.dataframe(filtered_data)
+                                else:
+                                    st.info("No valid data available for this country and segmentation.")
                         else:
                             st.warning(f"No valid data available for {selected_country} with {segmentation_type} segmentation.")
                     else:
@@ -2829,24 +2913,33 @@ def main():
                                         comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
                                         comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
                                         
-                                        # Remove rows with NaN values for the indicator
-                                        comparison_data = comparison_data.dropna(subset=[total_column])
+                                        # Don't remove NaN values - we'll handle them in analysis
+                                        # comparison_data = comparison_data.dropna(subset=[total_column])  # Removed this line
                                         
-                                        # Find the latest year where ALL countries have data
+                                        # Find the latest year where we have data for the most countries
                                         all_years = sorted(comparison_data['year'].unique(), reverse=True)
                                         
-                                        latest_common_year = None
+                                        best_year = None
+                                        max_countries = 0
+                                        
                                         for year in all_years:
                                             year_data = comparison_data[comparison_data['year'] == year]
-                                            countries_in_year = year_data['country'].unique()
+                                            # Only count countries that have non-null data for this year
+                                            countries_with_data_this_year = year_data[year_data[total_column].notna()]['country'].unique()
+                                            country_count = len(countries_with_data_this_year)
                                             
-                                            if all(country in countries_in_year for country in countries_with_data):
-                                                latest_common_year = year
-                                                break
+                                            if country_count > max_countries:
+                                                max_countries = country_count
+                                                best_year = year
+                                        
+                                        latest_common_year = best_year if best_year is not None and max_countries > 0 else None
                                         
                                         if latest_common_year is not None:
                                             # Get data for the latest common year
                                             latest_year_data = comparison_data[comparison_data['year'] == latest_common_year].copy()
+                                            
+                                            # Filter to only include countries with valid data for this year
+                                            latest_year_data = latest_year_data[latest_year_data[total_column].notna()]
                                             
                                             if not latest_year_data.empty:
                                                 # Prepare bar chart data for analysis
