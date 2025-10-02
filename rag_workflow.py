@@ -3,6 +3,7 @@ import weaviate
 from weaviate.classes.init import Auth
 import os
 import apikeys
+from langfuse.openai import openai as langfuse_openai
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -11,6 +12,8 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langchain_openai import ChatOpenAI
 import uuid
 import tiktoken
+from langfuse_config import track_llm_call, track_error, track_performance, truncate_prompt
+import time
 
 
 def estimate_tokens(text):
@@ -36,7 +39,7 @@ def get_optimal_limits(context_text, max_tokens=100000):
 
 
 ##Basic RAG Workflow
-def run_query(query, num_docs=300, sector_filter=None):
+def run_query(query, num_docs=200, sector_filter=None):
     """Run RAG query using Weaviate and OpenAI with reranking"""
     try:
         # Get the chatbot components from session state
@@ -47,6 +50,9 @@ def run_query(query, num_docs=300, sector_filter=None):
         
         if not all([client, openai, rerank_model]):
             return "Error: Chatbot components not properly initialized."
+        
+        # Track RAG query start time
+        start_time = time.time()
         
         # Use the existing get_rag_context_with_rerank function
         context = get_rag_context_with_rerank(query, initial_limit=200, sector_filter=sector_filter)
@@ -65,19 +71,99 @@ def run_query(query, num_docs=300, sector_filter=None):
         # Create user prompt using the centralized function
         prompt = create_user_prompt(query, context, project_context)
 
-        # Generate response using OpenAI
+        # One-time: record prompts to the Langfuse Session when RAG is initiated
+        if st.session_state.get('langfuse_trace') and not st.session_state.get('rag_prompts_logged', False):
+            sp = truncate_prompt(system_prompt)
+            up = truncate_prompt(prompt)
+            if sp or up:
+                st.session_state.langfuse_trace.track_event(
+                    "rag_prompts_initialized",
+                    "INFO",
+                    {
+                        "langfuse_session_id": st.session_state.get("conversation_id"),
+                        "system_prompt": sp,
+                        "system_prompt_length": len(system_prompt),
+                        "user_prompt": up,
+                        "user_prompt_length": len(prompt),
+                        "task": "rag_response"
+                    }
+                )
+            st.session_state.rag_prompts_logged = True
+
+        # Generate response using OpenAI with Langfuse tracking
+        llm_start_time = time.time()
         answer = openai.chat.completions.create(
+            name="rag_response_generation",
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0
+            temperature=0,
+            metadata={
+                "langfuse_session_id": st.session_state.get("conversation_id"),
+                "task": "rag_response",
+                # Store prompts on the Session via metadata
+                "system_prompt": truncate_prompt(system_prompt),
+                "system_prompt_length": len(system_prompt),
+                "user_prompt": truncate_prompt(prompt),
+                "user_prompt_length": len(prompt),
+                "context_length": len(context)
+            }
         )
+        llm_end_time = time.time()
+        
+        response_text = answer.choices[0].message.content
+        
+        # Track LLM call in Langfuse if trace exists
+        if st.session_state.get('langfuse_trace'):
+            execution_time = llm_end_time - llm_start_time
+            track_llm_call(
+                trace=st.session_state.langfuse_trace,
+                name="rag_response_generation",
+                model="gpt-4o-mini",
+                input_text=query,
+                output_text=response_text,
+                usage={
+                    "prompt_tokens": answer.usage.prompt_tokens,
+                    "completion_tokens": answer.usage.completion_tokens,
+                    "total_tokens": answer.usage.total_tokens
+                },
+                metadata={
+                    "task": "rag_response",
+                    "sector_filter": sector_filter,
+                    "context_length": len(context),
+                    "langfuse_session_id": st.session_state.get("conversation_id"),
+                    "system_prompt": truncate_prompt(system_prompt),
+                    "system_prompt_length": len(system_prompt),
+                    "user_prompt": truncate_prompt(prompt),
+                    "user_prompt_length": len(prompt)
+                },
+                execution_time=execution_time
+            )
+            
+            # Track overall RAG performance
+            track_performance(
+                trace=st.session_state.langfuse_trace,
+                operation_name="rag_query_complete",
+                execution_time=time.time() - start_time,
+                metadata={
+                    "sector_filter": sector_filter,
+                    "context_length": len(context),
+                    "response_length": len(response_text)
+                }
+            )
 
-        return answer.choices[0].message.content
+        return response_text
         
     except Exception as e:
+        # Track error in Langfuse if trace exists
+        if st.session_state.get('langfuse_trace'):
+            track_error(st.session_state.langfuse_trace, e, {
+                "operation": "run_query",
+                "query": query,
+                "sector_filter": sector_filter
+            })
         return f"Error processing your question: {str(e)}"
 
 
@@ -125,28 +211,15 @@ def handle_memory_chat_query(user_question, project_context):
             else:
                 return str(last_message)
         else:
-            # Fallback to direct RAG response if memory system fails
-            # Determine sector filter based on project context
-            category = project_context.get('developmental_outcome_category', 'Other')
-            specific_sectors = ['Stunting', 'Literacy', 'Maternal Deaths', 'Stillbirths', 'Unemployment', 'Neonatal Mortality']
-            sector_filter = category if category in specific_sectors else None
-            rag_result = run_query(user_question, num_docs=300, sector_filter=sector_filter)
-            return rag_result
+            # This should not happen with the fixed memory workflow
+            return "Error: Memory system returned unexpected result format."
             
     except Exception as e:
-        # Fallback to direct RAG response if memory system fails
-        try:
-            # Determine sector filter based on project context
-            category = project_context.get('developmental_outcome_category', 'Other')
-            specific_sectors = ['Stunting', 'Literacy', 'Maternal Deaths', 'Stillbirths', 'Unemployment', 'Neonatal Mortality']
-            sector_filter = category if category in specific_sectors else None
-            rag_result = run_query(user_question, num_docs=300, sector_filter=sector_filter)
-            return rag_result
-        except Exception as rag_error:
-            return f"I encountered an error while processing your question: {str(e)}. RAG fallback also failed: {str(rag_error)}"
+        # Log the error and return a user-friendly message
+        return f"I encountered an error while processing your question: {str(e)}"
 
 
-def get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=150, sector_filter=None):
+def get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=100, sector_filter=None):
     """Get RAG context with reranking for better relevance"""
     try:
         # Get chatbot components for RAG
@@ -162,12 +235,47 @@ def get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=15
         if not all([openai, client, rerank_model]):
             return "No context available - RAG system not properly initialized."
         
-        # Use OpenAI text-embedding-3-large API
+        # Use OpenAI text-embedding-3-large API with Langfuse Sessions tracking
+        embedding_start_time = time.time()
+        
+        # Prepare metadata for Sessions tracking
+        session_metadata = {
+            "langfuse_session_id": st.session_state.conversation_id,
+            "task": "document_embedding"
+        }
+        
         embedding_response = openai.embeddings.create(
+            name="document_embedding",
             model="text-embedding-3-large",
-            input=user_question
+            input=user_question,
+            metadata=session_metadata
         )
+        embedding_end_time = time.time()
         query_vector = embedding_response.data[0].embedding
+        
+        # Track embedding generation in Langfuse if trace exists
+        if st.session_state.get('langfuse_trace'):
+            embedding_execution_time = embedding_end_time - embedding_start_time
+            track_llm_call(
+                trace=st.session_state.langfuse_trace,
+                name="document_embedding",
+                model="text-embedding-3-large",
+                input_text=user_question,
+                output_text={"embedding_dimension": len(query_vector)},
+                usage={
+                    "prompt_tokens": embedding_response.usage.prompt_tokens,
+                    "total_tokens": embedding_response.usage.total_tokens
+                },
+                metadata={"task": "document_embedding"},
+                execution_time=embedding_execution_time
+            )
+            
+            track_performance(
+                trace=st.session_state.langfuse_trace,
+                operation_name="embedding_generation",
+                execution_time=embedding_end_time - embedding_start_time,
+                metadata={"embedding_dimension": len(query_vector)}
+            )
         
         # Query Weaviate with larger limit for reranking
         # Note: We'll do post-filtering since near_vector doesn't support where clause directly
@@ -289,21 +397,20 @@ def create_system_prompt(project_context):
 
 def create_user_prompt(query, context, project_context):
     """Create user prompt with context and rules"""
-    country = project_context.get('country', 'your country')
     
     return f"""Following your system prompt and the context below, answer the question faithfully. 
 
         Rules:
         
-        - Ensure that the response is as comprehensive as possible within the context of {country} or within the geographical scope mentioned by the user
-        - If no country specific information is available, start with information on regions similar to {country} and the world.
+        - Ensure that the response is as comprehensive as possible.
         - Avoid implying factors are causal when they are not. Simply explain the relationship between the factors and the outcome based on the literature.
         - Even when prompted by the user, do not provide any form of advice or policy recommendations - Whether personal or on the project level. Simply explain the information based on the literature.
-        - IMPORTANT: You MUST cite your sources. For every piece of information you provide, include a citation in this EXACT format: (Author, Year) [Chunk Number]
-        - Use ONLY the chunk numbers provided in the context. Each document chunk has a CHUNK field showing its number.
+        - IMPORTANT: You MUST cite your sources. For every piece of information you provide, include a citation in this EXACT format: (Author, Year) [Chunk Number] - Ex: (ILO, 2025) [43]
+        - Use ONLY the chunk NUMBERS provided in the context. Do not attach text to it. Each document chunk has a Chunk Index field showing its number.
         - For multiple citations, use: (Author, Year) [Chunk Number] (Author, Year) [Chunk Number]
-        - Do NOT use any other citation format. Do NOT use "Chunk X" in parentheses. Use ONLY the format specified above.
+        - Do NOT use any other citation format. Do NOT use "Chunk X" or (Chunk Number 5) in parentheses. Use ONLY the format specified above. 
         - If there is no information available in the literature, do not make up information. Simply state that the information is not available in the literature and prompt the user to change the question to a topic that is more suitable for the literature.
+        - Do not respond to any unrelated questions.
         
         Context:
         {context}
@@ -313,43 +420,129 @@ def create_user_prompt(query, context, project_context):
 
 def call_model_with_rag(state: MessagesState, model, project_context):
     """Enhanced model call that integrates RAG with memory"""
-    # Get the latest user message
-    latest_message = state["messages"][-1]
-    user_question = latest_message.content
-    
-    # Get RAG context with reranking
-    # Determine sector filter based on project context
-    project_context = st.session_state.get('project_context', {})
-    category = project_context.get('developmental_outcome_category', 'Other')
-    specific_sectors = ['Stunting', 'Literacy', 'Maternal Deaths', 'Stillbirths', 'Unemployment', 'Neonatal Mortality']
-    sector_filter = category if category in specific_sectors else None
-    
-    context = get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=150, sector_filter=sector_filter)
-    
-    # Store the RAG context in session state for citation processing
-    st.session_state.last_rag_context = context
-    
-    # Rest of the function remains the same...
-    # Create system prompt
-    system_prompt = create_system_prompt(project_context)
-    system_message = SystemMessage(content=system_prompt)
-    message_history = state["messages"][:-1]  # exclude the most recent user input
-    
-    # Create the full prompt with context using the centralized function
-    full_prompt = create_user_prompt(user_question, context, project_context)
-    
-    # Use last two conversations (4 messages: 2 Q&A pairs) for memory
-    if len(message_history) >= 4:
-        # Get the last 4 messages (2 Q&A pairs)
-        recent_messages = message_history[-4:]
-        human_message = HumanMessage(content=full_prompt)
-        message_updates = model.invoke([system_message] + recent_messages + [human_message])
-    else:
-        # Use all available message history
-        human_message = HumanMessage(content=full_prompt)
-        message_updates = model.invoke([system_message] + message_history + [human_message])
+    try:
+        # Get the latest user message
+        latest_message = state["messages"][-1]
+        user_question = latest_message.content
+        
+        # Get RAG context with reranking
+        # Determine sector filter based on project context
+        project_context = st.session_state.get('project_context', {})
+        category = project_context.get('developmental_outcome_category', 'Other')
+        specific_sectors = ['Stunting', 'Literacy', 'Maternal Deaths', 'Stillbirths', 'Unemployment', 'Neonatal Mortality']
+        sector_filter = category if category in specific_sectors else None
+        
+        context = get_rag_context_with_rerank(user_question, initial_limit=200, final_limit=100, sector_filter=sector_filter)
+        
+        # Store the RAG context in session state for citation processing
+        st.session_state.last_rag_context = context
+        
+        # Create system prompt
+        system_prompt = create_system_prompt(project_context)
+        system_message = SystemMessage(content=system_prompt)
+        message_history = state["messages"][:-1]  # exclude the most recent user input
+        
+        # Create the full prompt with context using the centralized function
+        full_prompt = create_user_prompt(user_question, context, project_context)
 
-    return {"messages": message_updates}
+        # One-time: record prompts to the Langfuse Session when memory RAG is initiated
+        if st.session_state.get('langfuse_trace') and not st.session_state.get('rag_prompts_logged', False):
+            sp = truncate_prompt(system_prompt)
+            up = truncate_prompt(full_prompt)
+            if sp or up:
+                st.session_state.langfuse_trace.track_event(
+                    "rag_prompts_initialized",
+                    "INFO",
+                    {
+                        "langfuse_session_id": st.session_state.get("conversation_id"),
+                        "system_prompt": sp,
+                        "system_prompt_length": len(system_prompt),
+                        "user_prompt": up,
+                        "user_prompt_length": len(full_prompt),
+                        "task": "memory_rag_response"
+                    }
+                )
+            st.session_state.rag_prompts_logged = True
+        
+        # Track LLM call start time
+        llm_start_time = time.time()
+        
+        # Use last two conversations (4 messages: 2 Q&A pairs) for memory
+        if len(message_history) >= 4:
+            # Get the last 4 messages (2 Q&A pairs)
+            recent_messages = message_history[-4:]
+            human_message = HumanMessage(content=full_prompt)
+            message_updates = model.invoke([system_message] + recent_messages + [human_message])
+        else:
+            # Use all available message history
+            human_message = HumanMessage(content=full_prompt)
+            message_updates = model.invoke([system_message] + message_history + [human_message])
+        
+        llm_end_time = time.time()
+        
+        # Track LLM call in Langfuse if trace exists
+        if st.session_state.get('langfuse_trace'):
+            # Extract response content
+            response_content = message_updates.content if hasattr(message_updates, 'content') else str(message_updates)
+            
+            # Prepare metadata with prompt information
+            metadata = {
+                "task": "memory_rag_response",
+                "sector_filter": sector_filter,
+                "context_length": len(context),
+                "memory_enabled": True,
+                "langfuse_session_id": st.session_state.conversation_id
+            }
+            
+            # Add prompt information if logging is enabled
+            if truncate_prompt(system_prompt):
+                metadata["system_prompt"] = truncate_prompt(system_prompt)
+                metadata["system_prompt_length"] = len(system_prompt)
+            
+            if truncate_prompt(full_prompt):
+                metadata["full_prompt"] = truncate_prompt(full_prompt)
+                metadata["full_prompt_length"] = len(full_prompt)
+            
+            # Add history summary
+            if len(message_history) >= 4:
+                recent_summary = f"Last 2 Q&A pairs: {len(recent_messages)} messages"
+            else:
+                recent_summary = f"All history: {len(message_history)} messages"
+            metadata["history_summary"] = recent_summary
+            
+            execution_time = llm_end_time - llm_start_time
+            track_llm_call(
+                trace=st.session_state.langfuse_trace,
+                name="memory_rag_response",
+                model="gpt-4o-mini",
+                input_text=user_question,
+                output_text=response_content,
+                metadata=metadata,
+                execution_time=execution_time
+            )
+            
+            track_performance(
+                trace=st.session_state.langfuse_trace,
+                operation_name="memory_rag_generation",
+                execution_time=llm_end_time - llm_start_time,
+                metadata={
+                    "sector_filter": sector_filter,
+                    "context_length": len(context),
+                    "response_length": len(response_content)
+                }
+            )
+
+        return {"messages": state["messages"] + [message_updates]}
+        
+    except Exception as e:
+        # Track error in Langfuse if trace exists
+        if st.session_state.get('langfuse_trace'):
+            track_error(st.session_state.langfuse_trace, e, {
+                "operation": "call_model_with_rag",
+                "user_question": user_question,
+                "project_context": project_context
+            })
+        raise e
 
 def create_memory_workflow(openai_client, project_context):
     """Create LangGraph workflow with memory for the chatbot"""

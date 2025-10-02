@@ -5,6 +5,10 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.ticker import MaxNLocator
+import json
+import apikeys
+from langfuse.openai import openai as langfuse_openai
+from openai import OpenAI
 
 # Define outcome indicators mapping
 OUTCOME_INDICATORS = {
@@ -240,12 +244,12 @@ def load_data():
                 break
         
         if df is None:
-            st.error("❌ Could not find the cleaned unemployment dataset. Please check the file path.")
+            st.warning("❌ Could not find the cleaned unemployment dataset. Please check the file path.")
             return None
         
         return df
     except Exception as e:
-        st.error(f"❌ Error loading dataset: {str(e)}")
+        st.warning(f"❌ Error loading dataset: {str(e)}")
         return None
 
 def load_dataset_summaries():
@@ -294,6 +298,79 @@ def get_countries_with_data(df, indicator_name):
     countries_with_data = df[df[total_column].notna()]['country'].unique()
     return sorted(countries_with_data)
 
+def generate_insights(data_json, indicator_name, country_name=None, countries_list=None, analysis_type="time_trend"):
+    """Generate insights using OpenAI GPT-4o based on the visualization data"""
+    try:
+        # Initialize OpenAI client
+        client = OpenAI(api_key=apikeys.OPENAI_API_KEY)
+        
+        # Get indicator information
+        indicator_info = OUTCOME_INDICATORS[indicator_name]
+        display_name = indicator_info['display_name']
+        unit = indicator_info['unit']
+        
+        # Create context for the prompt
+        if analysis_type == "time_trend":
+            context = f"Developmental Outcome: {display_name} ({unit})\nCountry: {country_name}\nAnalysis Type: Time trend analysis"
+        elif analysis_type == "segmented":
+            context = f"Developmental Outcome: {display_name} ({unit})\nCountry: {country_name}\nAnalysis Type: Segmented analysis"
+        elif analysis_type == "comparison":
+            countries_str = ", ".join(countries_list)
+            context = f"Developmental Outcome: {display_name} ({unit})\nCountries: {countries_str}\nAnalysis Type: Country comparison"
+        elif analysis_type == "benchmarking":
+            context = f"Developmental Outcome: {display_name} ({unit})\nCountry: {country_name}\nAnalysis Type: Global benchmarking analysis"
+        elif analysis_type == "peer_comparison":
+            context = f"Developmental Outcome: {display_name} ({unit})\nCountry: {country_name}\nAnalysis Type: Peer country comparison analysis"
+        
+        # Create the prompt
+        prompt = f"""You are a data analyst specializing in developmental outcomes and policy research. 
+
+Context: {context}
+
+Data (JSON format):
+{data_json}
+
+Please provide a 3-5 bullet point summary about th ekey trends shown in this data. Explain these trends within the context of what we know about {display_name} in {country_name if country_name else 'the selected countries'}. Focus on:
+1. Key patterns and trends
+2. Notable changes over time
+3. Contextual insights about what these trends might indicate
+4. Do not provide any policy advice or recommendations yourself. 
+5. Do not be vague and make sure that you support every arguement you make with the data and evidence in front of you.
+Keep the response concise, professional, and accessible to policy makers."""
+        
+        # Prepare metadata for Sessions tracking
+        session_metadata = {
+            "langfuse_session_id": st.session_state.get('conversation_id', 'visualization_session'),
+            "task": "visualization_insights",
+            "analysis_type": analysis_type,
+            "indicator_name": indicator_name
+        }
+        
+        # Add prompt to metadata if logging is enabled
+        from langfuse_config import truncate_prompt
+        truncated_prompt = truncate_prompt(prompt)
+        if truncated_prompt:
+            session_metadata["prompt_text"] = truncated_prompt
+            session_metadata["prompt_length"] = len(prompt)
+        
+        # Make API call with Sessions tracking
+        response = client.chat.completions.create(
+            name="visualization_insights",
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert data analyst specializing in developmental outcomes and policy research."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=500,
+            metadata=session_metadata
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"Error generating insights: {str(e)}"
+
 def format_annotation_value(value, dataset_values):
     """Format annotation value based on dataset characteristics"""
     if pd.isna(value):
@@ -333,7 +410,7 @@ def create_time_trend_chart(df, selected_country, indicator_name):
     # Get indicator mapping
     indicator = OUTCOME_INDICATORS.get(indicator_name)
     if indicator is None:
-        st.error(f"Unknown indicator: {indicator_name}")
+        st.warning(f"Unknown indicator: {indicator_name}")
         return None
     
     total_column = indicator["total"]
@@ -352,7 +429,7 @@ def create_time_trend_chart(df, selected_country, indicator_name):
     
     # Check if the required column exists and has valid data
     if total_column not in country_data.columns:
-        st.error(f"Column '{total_column}' not found in dataset for {selected_country}")
+        st.warning(f"Column '{total_column}' not found in dataset for {selected_country}")
         return None
     
     # Ensure indicator column is numeric
@@ -477,13 +554,13 @@ def create_segmented_trend_chart(df, selected_country, segmentation_type, indica
     # Get indicator mapping
     indicator = OUTCOME_INDICATORS.get(indicator_name)
     if indicator is None:
-        st.error(f"Unknown indicator: {indicator_name}")
+        st.warning(f"Unknown indicator: {indicator_name}")
         return None
     
     # Get segmentation options for this indicator
     segmentation_options = SEGMENTATION_OPTIONS.get(indicator_name, {})
     if segmentation_type not in segmentation_options:
-        st.error(f"Segmentation type '{segmentation_type}' not available for {indicator_name}")
+        st.warning(f"Segmentation type '{segmentation_type}' not available for {indicator_name}")
         return None
     
     segmentation_config = segmentation_options[segmentation_type]
@@ -700,7 +777,7 @@ def create_country_comparison_chart(df, selected_countries, indicator_name):
     # Create the chart
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # Define colors and markers for countries
+    # Define colors and markers for countries (limit to 3)
     colors = ['#667eea', '#e74c3c', '#3498db']
     markers = ['o', 's', '^']
     
@@ -893,7 +970,7 @@ def create_global_benchmarking_chart(df, selected_country, indicator_name):
     # Get indicator mapping
     indicator = OUTCOME_INDICATORS.get(indicator_name)
     if indicator is None:
-        st.error(f"Unknown indicator: {indicator_name}")
+        st.warning(f"Unknown indicator: {indicator_name}")
         return None
     
     total_column = indicator["total"]
@@ -1100,7 +1177,7 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
     # Get indicator mapping
     indicator = OUTCOME_INDICATORS.get(indicator_name)
     if indicator is None:
-        st.error(f"Unknown indicator: {indicator_name}")
+        st.warning(f"Unknown indicator: {indicator_name}")
         return None
     
     total_column = indicator["total"]
@@ -1216,9 +1293,9 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
     ax.set_ylabel(f'{display_name} ({unit})', fontsize=12, fontweight='bold')
     # Create dynamic title based on available data
     if region_name and any(v is not None for v in regional_values):
-        title = f'{display_name} Comparison - Last 3 Years\n{selected_country} vs {region_name} Average vs Global Average'
+        title = f'{display_name} Comparison\n{selected_country} vs {region_name} Average vs Global Average'
     else:
-        title = f'{display_name} Comparison - Last 3 Years\n{selected_country} vs Global Average'
+        title = f'{display_name} Comparison\n{selected_country} vs Global Average'
     
     ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
     ax.set_xticks(x)
@@ -1269,7 +1346,7 @@ def create_regional_comparison_chart(df, selected_country, indicator_name):
     # Get indicator mapping
     indicator = OUTCOME_INDICATORS.get(indicator_name)
     if indicator is None:
-        st.error(f"Unknown indicator: {indicator_name}")
+        st.warning(f"Unknown indicator: {indicator_name}")
         return None
     
     total_column = indicator["total"]
@@ -1369,6 +1446,309 @@ def create_regional_comparison_chart(df, selected_country, indicator_name):
     plt.tight_layout()
     return fig
 
+def create_peer_country_comparison_chart(df, selected_country, indicator_name):
+    """Create peer country comparison chart for selected country and its peer countries"""
+    if df is None or selected_country is None or indicator_name is None:
+        return None
+    
+    # Get indicator mapping
+    indicator = OUTCOME_INDICATORS.get(indicator_name)
+    if indicator is None:
+        st.warning(f"Unknown indicator: {indicator_name}")
+        return None
+    
+    total_column = indicator["total"]
+    display_name = indicator["display_name"]
+    unit = indicator["unit"]
+    
+    # Get peer countries for the selected country
+    country_data = df[df['country'] == selected_country]
+    if country_data.empty:
+        st.warning(f"No data available for {selected_country}")
+        return None
+    
+    # Get peer countries
+    peer_countries = []
+    explanation = ""
+    
+    if 'Country 2' in country_data.columns and not pd.isna(country_data['Country 2'].iloc[0]):
+        peer_countries.append(country_data['Country 2'].iloc[0])
+    if 'Country 3' in country_data.columns and not pd.isna(country_data['Country 3'].iloc[0]):
+        peer_countries.append(country_data['Country 3'].iloc[0])
+    if 'Country 4' in country_data.columns and not pd.isna(country_data['Country 4'].iloc[0]):
+        peer_countries.append(country_data['Country 4'].iloc[0])
+    
+    if 'Explanation' in country_data.columns and not pd.isna(country_data['Explanation'].iloc[0]):
+        explanation = country_data['Explanation'].iloc[0]
+    
+    if not peer_countries:
+        st.warning(f"No peer countries available for {selected_country}")
+        return None, "", []
+    
+    # Create list of all countries to compare (selected + peers)
+    all_countries = [selected_country] + peer_countries
+    
+    # Filter data for all countries
+    comparison_data = df[df['country'].isin(all_countries)].copy()
+    
+    if comparison_data.empty:
+        return None, explanation, []
+    
+    # Ensure year column is numeric
+    comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+    
+    # Ensure indicator column is numeric
+    comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
+    
+    # Sort by year
+    comparison_data = comparison_data.sort_values('year')
+    
+    # Filter out countries that don't have any valid data for this indicator
+    countries_with_data = []
+    for country in all_countries:
+        country_data = comparison_data[comparison_data['country'] == country]
+        valid_data = country_data.dropna(subset=[total_column])
+        if not valid_data.empty:
+            countries_with_data.append(country)
+    
+    if not countries_with_data:
+        st.warning("No countries have valid data for this indicator")
+        return None, explanation, []
+    
+    # Ensure selected country is always first and has data
+    if selected_country not in countries_with_data:
+        st.warning(f"No valid data available for {selected_country}")
+        return None, explanation, []
+    
+    # Reorder countries_with_data to put selected country first
+    countries_with_data = [selected_country] + [c for c in countries_with_data if c != selected_country]
+    
+    # Create the chart
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Define colors and markers for countries - selected country gets bold red
+    colors = ['#e74c3c', '#667eea', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']  # Bold red for selected country
+    markers = ['o', 's', '^', 'D', 'v', 'p']
+    
+    # Plot lines for each country
+    for i, country in enumerate(countries_with_data):
+        country_data = comparison_data[comparison_data['country'] == country].sort_values('year')
+        if not country_data.empty:
+            # Make selected country line thicker and more prominent
+            linewidth = 4 if country == selected_country else 3
+            markersize = 8 if country == selected_country else 6
+            alpha = 1.0 if country == selected_country else 0.9
+            
+            ax.plot(country_data['year'], country_data[total_column], 
+                   marker=markers[i % len(markers)], linewidth=linewidth, markersize=markersize, 
+                   color=colors[i], markerfacecolor=colors[i], 
+                   markeredgecolor='white', markeredgewidth=1,
+                   label=country, alpha=alpha)
+    
+    # Calculate year range for title
+    all_years = []
+    for country in countries_with_data:
+        country_data = comparison_data[comparison_data['country'] == country]
+        valid_data = country_data.dropna(subset=[total_column])
+        if not valid_data.empty:
+            all_years.extend(valid_data['year'].tolist())
+    
+    if all_years:
+        year_start = int(min(all_years))
+        year_end = int(max(all_years))
+        year_range = f"{year_start}-{year_end}"
+    else:
+        year_range = "Over Time"
+    
+    # Create subtitle with only countries that have data
+    peer_countries_with_data = [c for c in countries_with_data if c != selected_country]
+    if peer_countries_with_data:
+        peer_subtitle = f"{selected_country} vs. {', '.join(peer_countries_with_data)}"
+    else:
+        peer_subtitle = f"{selected_country} (no peer countries with data)"
+    
+    ax.set_title(f'{display_name} - Peer Country Comparison ({year_range})\n{peer_subtitle}', 
+                fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('Year', fontsize=12, fontweight='bold')
+    ax.set_ylabel(f'{display_name} ({unit})', fontsize=12, fontweight='bold')
+    
+    # Add legend
+    ax.legend(loc='best', fontsize=12, framealpha=0.9)
+    
+    # Customize the plot
+    ax.grid(True, alpha=0.3)
+    
+    # Set x-axis limits based on actual data range
+    if all_years:
+        min_year = float(min(all_years))
+        max_year = float(max(all_years))
+        ax.set_xlim(min_year - 0.5, max_year + 0.5)
+    
+    # Add value labels on points
+    dataset_values = []
+    for country in countries_with_data:
+        country_data = comparison_data[comparison_data['country'] == country]
+        dataset_values.extend(country_data[total_column].tolist())
+    
+    for i, country in enumerate(countries_with_data):
+        country_data = comparison_data[comparison_data['country'] == country].sort_values('year')
+        if not country_data.empty:
+            data_points = list(zip(country_data['year'], country_data[total_column]))
+            if len(data_points) >= 11:
+                # Annotate every other point starting from the end
+                for j in range(len(data_points) - 1, -1, -2):
+                    year, value = data_points[j]
+                    annotation_text = format_annotation_value(value, dataset_values)
+                    if annotation_text is not None:
+                        ax.annotate(annotation_text, (year, value), 
+                                   textcoords="offset points", xytext=(0,10), ha='center',
+                                   fontsize=8, fontweight='bold', color=colors[i])
+            else:
+                # Annotate all points if less than 11
+                for year, value in data_points:
+                    annotation_text = format_annotation_value(value, dataset_values)
+                    if annotation_text is not None:
+                        ax.annotate(annotation_text, (year, value), 
+                                   textcoords="offset points", xytext=(0,10), ha='center',
+                                   fontsize=8, fontweight='bold', color=colors[i])
+    
+    # Set y-axis limits
+    all_values = []
+    for country in countries_with_data:
+        country_data = comparison_data[comparison_data['country'] == country]
+        if total_column in country_data.columns:
+            max_val = country_data[total_column].max()
+            if not pd.isna(max_val) and not np.isinf(max_val):
+                all_values.append(max_val)
+    
+    if all_values:
+        ymax = max(all_values)
+        if pd.isna(ymax) or np.isinf(ymax):
+            ax.set_ylim(0, 10)
+        else:
+            ax.set_ylim(0, ymax + max(ymax * 0.1, 5))
+    else:
+        ax.set_ylim(0, 10)
+    
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    
+    plt.tight_layout()
+    return fig, explanation, countries_with_data
+
+def create_peer_country_bar_chart(df, selected_country, indicator_name, countries_with_data):
+    """Create bar chart for latest year with data for all countries"""
+    if df is None or selected_country is None or indicator_name is None or not countries_with_data:
+        return None
+    
+    # Get indicator mapping
+    indicator = OUTCOME_INDICATORS.get(indicator_name)
+    if indicator is None:
+        return None
+    
+    total_column = indicator["total"]
+    display_name = indicator["display_name"]
+    unit = indicator["unit"]
+    
+    # Filter data for countries with data
+    comparison_data = df[df['country'].isin(countries_with_data)].copy()
+    
+    # Ensure year and indicator columns are numeric
+    comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+    comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
+    
+    # Remove rows with NaN values for the indicator
+    comparison_data = comparison_data.dropna(subset=[total_column])
+    
+    if comparison_data.empty:
+        return None
+    
+    # Find the latest year where ALL countries have data
+    # Get the latest year for each country
+    country_latest_years = {}
+    for country in countries_with_data:
+        country_data = comparison_data[comparison_data['country'] == country]
+        if not country_data.empty:
+            country_latest_years[country] = country_data['year'].max()
+    
+    if not country_latest_years:
+        return None
+    
+    # Find the latest year where all countries have data
+    # We need to find a year where ALL countries have data
+    all_years = sorted(comparison_data['year'].unique(), reverse=True)  # Start from latest
+    
+    latest_common_year = None
+    for year in all_years:
+        year_data = comparison_data[comparison_data['year'] == year]
+        countries_in_year = year_data['country'].unique()
+        
+        # Check if all countries_with_data are present in this year
+        if all(country in countries_in_year for country in countries_with_data):
+            latest_common_year = year
+            break
+    
+    if latest_common_year is None:
+        return None
+    
+    # Get data for the latest common year
+    latest_year_data = comparison_data[comparison_data['year'] == latest_common_year].copy()
+    
+    if latest_year_data.empty:
+        return None
+    
+    # Sort by value (highest to lowest) - this will naturally put highest values first
+    latest_year_data = latest_year_data.sort_values(total_column, ascending=False)
+    
+    # Create the bar chart
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Prepare data for plotting
+    countries = latest_year_data['country'].tolist()
+    values = latest_year_data[total_column].tolist()
+    
+    # Create color list (bold red for selected country, others in different colors)
+    colors = ['#e74c3c', '#667eea', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
+    bar_colors = []
+    
+    # Assign colors based on country position, but make selected country always red
+    for i, country in enumerate(countries):
+        if country == selected_country:
+            bar_colors.append('#e74c3c')  # Bold red for selected country
+        else:
+            bar_colors.append(colors[(i + 1) % len(colors)])  # Other colors for peers
+    
+    # Create bars
+    bars = ax.bar(countries, values, color=bar_colors, alpha=0.8, 
+                 edgecolor='#2c3e50', linewidth=2)
+    
+    # Make selected country bar thicker/bolder
+    for i, country in enumerate(countries):
+        if country == selected_country:
+            bars[i].set_linewidth(3)
+            break
+    
+    # Customize the chart
+    ax.set_xlabel('Country', fontsize=12, fontweight='bold')
+    ax.set_ylabel(f'{display_name} ({unit})', fontsize=12, fontweight='bold')
+    ax.set_title(f'{display_name} - {selected_country} and Peer Countries\n({int(latest_common_year)})', 
+                fontsize=16, fontweight='bold', pad=20)
+    
+    # Rotate x-axis labels for better readability
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + max(values) * 0.01,
+                f'{value:.1f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Customize the plot
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(0, max(values) + max(values) * 0.15)
+    
+    plt.tight_layout()
+    return fig
+
 def main():
     # Initialize session state
     if 'show_time_trends' not in st.session_state:
@@ -1379,6 +1759,8 @@ def main():
         st.session_state.show_country_comparison = False
     if 'show_global_benchmarking' not in st.session_state:
         st.session_state.show_global_benchmarking = False
+    if 'show_peer_benchmarking' not in st.session_state:
+        st.session_state.show_peer_benchmarking = False
     if 'selected_indicator' not in st.session_state:
         st.session_state.selected_indicator = "Unemployment"
     
@@ -1437,15 +1819,40 @@ def main():
                 )
                 
                 if selected_country:
-                    # Show dataset summary
+                    # Show Information on Dataset
                     if st.session_state.selected_indicator in dataset_summaries:
-                        with st.expander("📋 Dataset Summary", expanded=True):
-                            st.markdown(dataset_summaries[st.session_state.selected_indicator])
+                        with st.expander("📋 Information on Dataset", expanded=True):
+                            st.text(dataset_summaries[st.session_state.selected_indicator])
                     
                     # Create and display the chart
                     chart = create_time_trend_chart(df, selected_country, st.session_state.selected_indicator)
                     if chart:
                         st.pyplot(chart)
+                        
+                        # Generate Insights button
+                        st.markdown("---")
+                        if st.button("🤖 Generate Insights", key="insights_time_trend", type="secondary"):
+                            with st.spinner("Generating insights..."):
+                                # Prepare data for AI analysis
+                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                total_column = indicator_info['total']
+                                
+                                # Filter data for the specific indicator
+                                chart_data = country_data[['year', total_column]].dropna()
+                                data_json = chart_data.to_json(orient='records')
+                                
+                                # Generate insights
+                                insights = generate_insights(
+                                    data_json=data_json,
+                                    indicator_name=st.session_state.selected_indicator,
+                                    country_name=selected_country,
+                                    analysis_type="time_trend"
+                                )
+                                
+                                # Display insights
+                                st.markdown("### 🤖 AI-Generated Insights")
+                                st.info(insights)
                         
                         # Show data summary
                         country_data = df[df['country'] == selected_country].sort_values('year')
@@ -1453,14 +1860,17 @@ def main():
                         
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.metric("Years of Data", len(country_data['year'].unique()))
-                        with col2:
                             indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                             total_column = indicator_info['total']
+                            
+                            # Get years with valid data for the specific indicator
+                            valid_data = country_data.dropna(subset=[total_column])
+                            years_with_data = len(valid_data['year'].unique()) if not valid_data.empty else 0
+                            st.metric("Years of Data", years_with_data)
+                        with col2:
                             unit = indicator_info['unit']
                             
                             # Get the latest year with valid data
-                            valid_data = country_data.dropna(subset=[total_column])
                             if not valid_data.empty:
                                 latest_data_row = valid_data.iloc[-1]
                                 latest_year = latest_data_row['year']
@@ -1508,7 +1918,7 @@ def main():
                 st.warning(f"⚠️ No countries have data available for {st.session_state.selected_indicator}")
                 st.info("Please select a different development outcome indicator.")
         else:
-            st.error("Could not load the dataset. Please check the file path.")
+            st.warning("Could not load the dataset. Please check the file path.")
         
         # Back button
         if st.button("← Back to Main Dashboard"):
@@ -1535,7 +1945,6 @@ def main():
                     # Back button
                     if st.button("← Back to Main Dashboard", key="back_segmented_1"):
                         st.session_state.show_segmented_trends = False
-                        st.rerun()
                 else:
                     # Create two columns for dropdowns
                     col1, col2 = st.columns(2)
@@ -1563,10 +1972,10 @@ def main():
                     
                     # Only show chart and data after both selections are made
                     if selected_country and segmentation_type:
-                        # Show dataset summary
+                        # Show Information on Dataset
                         if st.session_state.selected_indicator in dataset_summaries:
-                            with st.expander("📋 Dataset Summary", expanded=True):
-                                st.markdown(dataset_summaries[st.session_state.selected_indicator])
+                            with st.expander("📋 Information on Dataset", expanded=True):
+                                st.text(dataset_summaries[st.session_state.selected_indicator])
                         
                         st.markdown("---")
                         st.markdown("### 📊 Visualization")
@@ -1575,6 +1984,35 @@ def main():
                         chart = create_segmented_trend_chart(df, selected_country, segmentation_type, st.session_state.selected_indicator)
                         if chart:
                             st.pyplot(chart)
+                            
+                            # Generate Insights button
+                            st.markdown("---")
+                            if st.button("🤖 Generate Insights", key="insights_segmented", type="secondary"):
+                                with st.spinner("Generating insights..."):
+                                    # Prepare data for AI analysis
+                                    country_data = df[df['country'] == selected_country].sort_values('year')
+                                    indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                    segmentation_config = segmentation_options[segmentation_type]
+                                    
+                                    # Get all segmentation columns
+                                    columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
+                                    columns_to_show = ['year'] + list(columns.values())
+                                    
+                                    # Filter data for the specific indicator and segmentation
+                                    chart_data = country_data[columns_to_show].dropna(subset=list(columns.values()), how='all')
+                                    data_json = chart_data.to_json(orient='records')
+                                    
+                                    # Generate insights
+                                    insights = generate_insights(
+                                        data_json=data_json,
+                                        indicator_name=st.session_state.selected_indicator,
+                                        country_name=selected_country,
+                                        analysis_type="segmented"
+                                    )
+                                    
+                                    # Display insights
+                                    st.markdown("### 🤖 AI-Generated Insights")
+                                    st.info(insights)
                             
                             # Show raw data
                             country_data = df[df['country'] == selected_country].sort_values('year')
@@ -1601,7 +2039,7 @@ def main():
                 st.warning(f"⚠️ No countries have data available for {st.session_state.selected_indicator}")
                 st.info("Please select a different development outcome indicator.")
         else:
-            st.error("Could not load the dataset. Please check the file path.")
+            st.warning("Could not load the dataset. Please check the file path.")
         
         # Back button
         if st.button("← Back to Main Dashboard", key="back_segmented_2"):
@@ -1618,7 +2056,7 @@ def main():
             
             if countries:
                 # Country selection dropdowns
-                st.markdown("**Select Countries to Compare (minimum 2):**")
+                st.markdown("**Select Countries to Compare (maximum 3):**")
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
@@ -1648,19 +2086,44 @@ def main():
                         key="comparison_country3"
                     )
                 
-                # Filter out empty selections
-                selected_countries = [c for c in [country1, country2, country3] if c]
+                # Filter out empty selections and limit to 3 countries
+                selected_countries = [c for c in [country1, country2, country3] if c][:3]
                 
                 if len(selected_countries) >= 2:
-                    # Show dataset summary
+                    # Show Information on Dataset
                     if st.session_state.selected_indicator in dataset_summaries:
-                        with st.expander("📋 Dataset Summary", expanded=True):
-                            st.markdown(dataset_summaries[st.session_state.selected_indicator])
+                        with st.expander("📋 Information on Dataset", expanded=True):
+                            st.text(dataset_summaries[st.session_state.selected_indicator])
                     
                     # Create and display the chart
                     chart = create_country_comparison_chart(df, selected_countries, st.session_state.selected_indicator)
                     if chart:
                         st.pyplot(chart)
+                        
+                        # Generate Insights button
+                        st.markdown("---")
+                        if st.button("🤖 Generate Insights", key="insights_comparison", type="secondary"):
+                            with st.spinner("Generating insights..."):
+                                # Prepare data for AI analysis
+                                comparison_data = df[df['country'].isin(selected_countries)].sort_values(['country', 'year'])
+                                indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                total_column = indicator_info['total']
+                                
+                                # Filter data for the specific indicator
+                                chart_data = comparison_data[['country', 'year', total_column]].dropna()
+                                data_json = chart_data.to_json(orient='records')
+                                
+                                # Generate insights
+                                insights = generate_insights(
+                                    data_json=data_json,
+                                    indicator_name=st.session_state.selected_indicator,
+                                    countries_list=selected_countries,
+                                    analysis_type="comparison"
+                                )
+                                
+                                # Display insights
+                                st.markdown("### 🤖 AI-Generated Insights")
+                                st.info(insights)
                         
                         # Show data summary
                         st.markdown("### 📈 Comparison Summary")
@@ -1719,12 +2182,12 @@ def main():
                     else:
                         st.warning("No valid data available for the selected countries.")
                 else:
-                    st.info("👆 Please select at least 2 countries to view the comparison.")
+                    st.info("👆 Please select at least 2 countries to view the comparison (maximum 3).")
             else:
                 st.warning(f"⚠️ No countries have data available for {st.session_state.selected_indicator}")
                 st.info("Please select a different development outcome indicator.")
         else:
-            st.error("Could not load the dataset. Please check the file path.")
+            st.warning("Could not load the dataset. Please check the file path.")
         
         # Back button
         if st.button("← Back to Main Dashboard", key="back_comparison"):
@@ -1733,7 +2196,7 @@ def main():
     
     elif st.session_state.show_global_benchmarking:
         # Show Global Benchmarking interface
-        st.markdown("### ⚖️ Global Benchmarking Analysis")
+        st.markdown("### ⚖️ Country Benchmarking (Regional and Global) Analysis")
         
         if df is not None:
             # Get countries that have data for the selected indicator
@@ -1750,15 +2213,53 @@ def main():
                 )
                 
                 if selected_country:
-                    # Show dataset summary
+                    # Show Information on Dataset
                     if st.session_state.selected_indicator in dataset_summaries:
-                        with st.expander("📋 Dataset Summary", expanded=True):
-                            st.markdown(dataset_summaries[st.session_state.selected_indicator])
+                        with st.expander("📋 Information on Dataset", expanded=True):
+                            st.text(dataset_summaries[st.session_state.selected_indicator])
                     
                     # Create and display the line chart
                     chart = create_global_benchmarking_chart(df, selected_country, st.session_state.selected_indicator)
                     if chart:
                         st.pyplot(chart)
+                        
+                        # Generate Insights button
+                        st.markdown("---")
+                        if st.button("🤖 Generate Insights", key="insights_benchmarking", type="secondary"):
+                            with st.spinner("Generating insights..."):
+                                # Prepare data for AI analysis
+                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
+                                indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                total_column = indicator_info['total']
+                                
+                                # Prepare country data
+                                country_chart_data = country_data[['year', total_column]].dropna()
+                                
+                                # Prepare global averages data
+                                if global_averages is not None and not global_averages.empty:
+                                    global_chart_data = global_averages[['year', 'global_average']].rename(columns={'global_average': total_column})
+                                    
+                                    # Combine data for analysis
+                                    combined_data = {
+                                        'country_data': country_chart_data.to_dict('records'),
+                                        'global_averages': global_chart_data.to_dict('records')
+                                    }
+                                    data_json = json.dumps(combined_data)
+                                else:
+                                    data_json = country_chart_data.to_json(orient='records')
+                                
+                                # Generate insights
+                                insights = generate_insights(
+                                    data_json=data_json,
+                                    indicator_name=st.session_state.selected_indicator,
+                                    country_name=selected_country,
+                                    analysis_type="benchmarking"
+                                )
+                                
+                                # Display insights
+                                st.markdown("### 🤖 AI-Generated Insights")
+                                st.info(insights)
                     
                     # Create and display the bar chart for last 3 years
                     st.markdown("---")
@@ -1766,6 +2267,52 @@ def main():
                     bar_chart = create_benchmarking_bar_chart(df, selected_country, st.session_state.selected_indicator)
                     if bar_chart:
                         st.pyplot(bar_chart)
+                        
+                        # Generate Insights button for bar chart
+                        st.markdown("---")
+                        if st.button("🤖 Generate Insights", key="insights_bar_chart", type="secondary"):
+                            with st.spinner("Generating insights..."):
+                                # Prepare data for AI analysis (last 3 years)
+                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
+                                indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                total_column = indicator_info['total']
+                                
+                                # Get last 3 years data
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
+                                last_3_years_data = country_data.dropna(subset=[total_column]).tail(3)
+                                
+                                if not last_3_years_data.empty and global_averages is not None:
+                                    # Filter global averages for the same years
+                                    last_3_years = last_3_years_data['year'].unique()
+                                    global_averages['year'] = pd.to_numeric(global_averages['year'], errors='coerce')
+                                    global_averages_filtered = global_averages[global_averages['year'].isin(last_3_years)]
+                                    
+                                    # Prepare combined data
+                                    country_chart_data = last_3_years_data[['year', total_column]]
+                                    global_chart_data = global_averages_filtered[['year', 'global_average']].rename(columns={'global_average': total_column})
+                                    
+                                    combined_data = {
+                                        'country_data': country_chart_data.to_dict('records'),
+                                        'global_averages': global_chart_data.to_dict('records'),
+                                        'analysis_period': 'last_3_years'
+                                    }
+                                    data_json = json.dumps(combined_data)
+                                else:
+                                    data_json = last_3_years_data[['year', total_column]].to_json(orient='records')
+                                
+                                # Generate insights
+                                insights = generate_insights(
+                                    data_json=data_json,
+                                    indicator_name=st.session_state.selected_indicator,
+                                    country_name=selected_country,
+                                    analysis_type="benchmarking"
+                                )
+                                
+                                # Display insights
+                                st.markdown("### 🤖 AI-Generated Insights")
+                                st.info(insights)
                     else:
                         st.info("Bar chart not available - insufficient data for the last 3 years.")
                     
@@ -1775,6 +2322,59 @@ def main():
                     regional_chart = create_regional_comparison_chart(df, selected_country, st.session_state.selected_indicator)
                     if regional_chart:
                         st.pyplot(regional_chart)
+                        
+                        # Generate Insights button for regional comparison
+                        st.markdown("---")
+                        if st.button("🤖 Generate Insights", key="insights_regional_chart", type="secondary"):
+                            with st.spinner("Generating insights..."):
+                                # Prepare data for AI analysis (regional comparison)
+                                country_data = df[df['country'] == selected_country].sort_values('year')
+                                indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                total_column = indicator_info['total']
+                                
+                                # Get the latest year with data for the selected country
+                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
+                                latest_year = country_data.dropna(subset=[total_column])['year'].max()
+                                
+                                # Get regional data for the latest year
+                                region = country_data['region'].iloc[0]
+                                regional_data = df[df['region'] == region].copy()
+                                regional_data['year'] = pd.to_numeric(regional_data['year'], errors='coerce')
+                                regional_data[total_column] = pd.to_numeric(regional_data[total_column], errors='coerce')
+                                
+                                latest_year_data = regional_data[
+                                    (regional_data['year'] == latest_year) & 
+                                    (regional_data[total_column].notna())
+                                ].sort_values(total_column, ascending=False)
+                                
+                                if not latest_year_data.empty:
+                                    # Prepare regional comparison data
+                                    regional_chart_data = latest_year_data[['country', total_column]].copy()
+                                    regional_chart_data['is_selected_country'] = regional_chart_data['country'] == selected_country
+                                    
+                                    combined_data = {
+                                        'regional_data': regional_chart_data.to_dict('records'),
+                                        'selected_country': selected_country,
+                                        'region': region,
+                                        'latest_year': int(latest_year),
+                                        'analysis_type': 'regional_comparison'
+                                    }
+                                    data_json = json.dumps(combined_data)
+                                else:
+                                    data_json = f'{{"error": "No regional data available for {latest_year}"}}'
+                                
+                                # Generate insights
+                                insights = generate_insights(
+                                    data_json=data_json,
+                                    indicator_name=st.session_state.selected_indicator,
+                                    country_name=selected_country,
+                                    analysis_type="benchmarking"
+                                )
+                                
+                                # Display insights
+                                st.markdown("### 🤖 AI-Generated Insights")
+                                st.info(insights)
                     else:
                         st.info("Regional comparison chart not available - insufficient regional data.")
                         
@@ -1888,11 +2488,214 @@ def main():
                 st.warning(f"⚠️ No countries have data available for {st.session_state.selected_indicator}")
                 st.info("Please select a different development outcome indicator.")
         else:
-            st.error("Could not load the dataset. Please check the file path.")
+            st.warning("Could not load the dataset. Please check the file path.")
         
         # Back button
         if st.button("← Back to Main Dashboard", key="back_benchmarking"):
             st.session_state.show_global_benchmarking = False
+            st.rerun()
+    
+    elif st.session_state.show_peer_benchmarking:
+        # Show Peer Country Benchmarking interface
+        st.markdown("### 👥 Peer Country Benchmarking Analysis")
+        
+        if df is not None:
+            # Get countries that have peer country data
+            countries_with_peers = df[df['Country 2'].notna()]['country'].unique()
+            
+            if len(countries_with_peers) > 0:
+                # Country selection dropdown
+                selected_country = st.selectbox(
+                    "Select a Country:",
+                    options=sorted(countries_with_peers),
+                    index=0,
+                    help=f"Choose a country to compare against its peer countries for {st.session_state.selected_indicator.lower()}",
+                    key="peer_benchmarking_country"
+                )
+                
+                if selected_country:
+                    # Show Information on Dataset
+                    if st.session_state.selected_indicator in dataset_summaries:
+                        with st.expander("📋 Information on Dataset", expanded=True):
+                            st.text(dataset_summaries[st.session_state.selected_indicator])
+                    
+                    # Create and display the charts
+                    chart_result = create_peer_country_comparison_chart(df, selected_country, st.session_state.selected_indicator)
+                    if chart_result is not None:
+                        chart, explanation, countries_with_data = chart_result
+                        if chart:
+                            st.pyplot(chart)
+                            
+                            # Generate Insights button for line chart (time trends) - directly below line chart
+                            st.markdown("---")
+                            st.markdown("#### 🤖 Generate Insights for Time Trends")
+                            if st.button("🤖 Generate Insights", key="insights_line_chart", type="secondary"):
+                                with st.spinner("Generating insights..."):
+                                    # Prepare data for AI analysis using countries_with_data
+                                    comparison_data = df[df['country'].isin(countries_with_data)].sort_values(['country', 'year'])
+                                    indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                    total_column = indicator_info['total']
+                                    
+                                    # Filter data for the specific indicator
+                                    chart_data = comparison_data[['country', 'year', total_column]].dropna()
+                                    data_json = chart_data.to_json(orient='records')
+                                    
+                                    # Generate insights
+                                    insights = generate_insights(
+                                        data_json=data_json,
+                                        indicator_name=st.session_state.selected_indicator,
+                                        country_name=selected_country,
+                                        analysis_type="peer_comparison"
+                                    )
+                                    
+                                    # Display insights
+                                    st.markdown("### 🤖 AI-Generated Insights")
+                                    st.info(insights)
+                            
+                            # Create and display the bar chart
+                            st.markdown("---")
+                            st.markdown("### 📊 Latest Year Comparison")
+                            bar_chart = create_peer_country_bar_chart(df, selected_country, st.session_state.selected_indicator, countries_with_data)
+                            if bar_chart:
+                                st.pyplot(bar_chart)
+                                
+                                # Generate Insights button for bar chart - directly below bar chart
+                                st.markdown("---")
+                                st.markdown("#### 🤖 Generate Insights for Latest Year Comparison")
+                                if st.button("🤖 Generate Insights", key="insights_bar_chart", type="secondary"):
+                                    with st.spinner("Generating insights..."):
+                                        # Prepare data for AI analysis (latest year comparison)
+                                        comparison_data = df[df['country'].isin(countries_with_data)].copy()
+                                        indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                                        total_column = indicator_info['total']
+                                        
+                                        # Ensure year and indicator columns are numeric
+                                        comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+                                        comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
+                                        
+                                        # Remove rows with NaN values for the indicator
+                                        comparison_data = comparison_data.dropna(subset=[total_column])
+                                        
+                                        # Find the latest year where ALL countries have data
+                                        all_years = sorted(comparison_data['year'].unique(), reverse=True)
+                                        
+                                        latest_common_year = None
+                                        for year in all_years:
+                                            year_data = comparison_data[comparison_data['year'] == year]
+                                            countries_in_year = year_data['country'].unique()
+                                            
+                                            if all(country in countries_in_year for country in countries_with_data):
+                                                latest_common_year = year
+                                                break
+                                        
+                                        if latest_common_year is not None:
+                                            # Get data for the latest common year
+                                            latest_year_data = comparison_data[comparison_data['year'] == latest_common_year].copy()
+                                            
+                                            if not latest_year_data.empty:
+                                                # Prepare bar chart data for analysis
+                                                bar_chart_data = latest_year_data[['country', total_column]].copy()
+                                                bar_chart_data['year'] = latest_common_year
+                                                
+                                                combined_data = {
+                                                    'bar_chart_data': bar_chart_data.to_dict('records'),
+                                                    'selected_country': selected_country,
+                                                    'latest_year': int(latest_common_year),
+                                                    'analysis_type': 'latest_year_comparison'
+                                                }
+                                                data_json = json.dumps(combined_data)
+                                            else:
+                                                data_json = f'{{"error": "No data available for {latest_common_year}"}}'
+                                        else:
+                                            data_json = '{"error": "No latest year data available"}'
+                                        
+                                        # Generate insights
+                                        insights = generate_insights(
+                                            data_json=data_json,
+                                            indicator_name=st.session_state.selected_indicator,
+                                            country_name=selected_country,
+                                            analysis_type="peer_comparison"
+                                        )
+                                        
+                                        # Display insights
+                                        st.markdown("### 🤖 AI-Generated Insights")
+                                        st.info(insights)
+                            else:
+                                st.info("Bar chart not available - insufficient data for latest year comparison.")
+                            
+                            # Show explanation
+                            if explanation:
+                                st.markdown("---")
+                                st.markdown("### 📝 Why These Countries Were Selected")
+                                st.info(explanation)
+                            
+                            # Show data summary
+                            st.markdown("### 📈 Peer Comparison Summary")
+                            
+                            # Create metrics for each country using countries_with_data
+                            indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
+                            total_column = indicator_info['total']
+                            unit = indicator_info['unit']
+                            
+                            cols = st.columns(len(countries_with_data))
+                            for i, country in enumerate(countries_with_data):
+                                with cols[i]:
+                                    country_data = df[df['country'] == country].sort_values('year')
+                                    valid_data = country_data.dropna(subset=[total_column])
+                                    
+                                    if not valid_data.empty:
+                                        latest_data_row = valid_data.iloc[-1]
+                                        latest_year = latest_data_row['year']
+                                        latest_value = latest_data_row[total_column]
+                                        
+                                        # Calculate trend
+                                        if len(valid_data) > 1:
+                                            first_value = valid_data[total_column].iloc[0]
+                                            last_value = valid_data[total_column].iloc[-1]
+                                            
+                                            # Convert to numeric if needed
+                                            try:
+                                                first_value = float(first_value)
+                                                last_value = float(last_value)
+                                                trend = last_value - first_value
+                                                year_start = int(valid_data['year'].min())
+                                                year_end = int(valid_data['year'].max())
+                                                st.metric(f"{country} ({year_start}-{year_end})", f"{trend:+.1f}{unit}")
+                                            except (ValueError, TypeError):
+                                                st.metric(f"{country}", "N/A")
+                                        else:
+                                            st.metric(f"{country}", "Single data point")
+                                    else:
+                                        st.metric(f"{country}", "No valid data")
+                            
+                            # Show raw data
+                            with st.expander("View Raw Data"):
+                                comparison_data = df[df['country'].isin(countries_with_data)].sort_values(['country', 'year'])
+                                display_data = comparison_data[['country', 'year', total_column]].copy()
+                                
+                                # Filter out years where ALL countries have no data
+                                years_with_data = display_data.dropna(subset=[total_column])['year'].unique()
+                                if len(years_with_data) > 0:
+                                    filtered_data = display_data[display_data['year'].isin(years_with_data)]
+                                    filtered_data = filtered_data.rename(columns={
+                                        total_column: f'{indicator_info["display_name"]} ({unit})'
+                                    })
+                                    st.dataframe(filtered_data)
+                                else:
+                                    st.info("No valid data available for comparison.")
+                        else:
+                            st.warning("No valid data available for peer country comparison.")
+                    else:
+                        st.warning("No peer countries available for the selected country.")
+            else:
+                st.warning("⚠️ No countries have peer country data available")
+                st.info("Peer country comparisons are not available for any countries in the dataset.")
+        else:
+            st.warning("Could not load the dataset. Please check the file path.")
+        
+        # Back button
+        if st.button("← Back to Main Dashboard", key="back_peer_benchmarking"):
+            st.session_state.show_peer_benchmarking = False
             st.rerun()
     
     else:
@@ -1922,20 +2725,28 @@ def main():
                 st.session_state.show_country_comparison = True
                 st.rerun()
         
-        # Square 4: Country Benchmarking
+        # Square 4: Country Benchmarking (Regional and Global)
         with col4:
-            if st.button("⚖️ Global Benchmarking", key="btn4", use_container_width=True):
+            if st.button("⚖️ Country Benchmarking (Regional and Global)", key="btn4", use_container_width=True):
                 st.session_state.show_global_benchmarking = True
                 st.rerun()
+        
+        # Square 5: Peer Country Benchmarking
+        col5, col6 = st.columns(2)
+        
+        with col5:
+            if st.button("👥 Country Benchmarking (Peer Countries)", key="btn5", use_container_width=True):
+                st.session_state.show_peer_benchmarking = True
+                st.rerun()
+        
+        # Empty column for layout
+        with col6:
+            st.empty()
         
         st.markdown('</div>', unsafe_allow_html=True)
     
     # Footer information
     st.markdown("---")
-    st.markdown("""
-    ### About This Dashboard
-    xxx
-    """)
 
 if __name__ == "__main__":
     main()

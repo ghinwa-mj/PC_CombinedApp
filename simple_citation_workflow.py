@@ -5,16 +5,27 @@ from weaviate.collections.classes.filters import Filter
 def parse_citations_from_response(response_text):
     """
     Parse citations from response text and extract chunk information.
-    Handles formats: (Author, Year) [Chunk Number] or (Author, Year, Chunk Index)
+    Handles formats: (Author, Year) [Chunk Number], (Author, Year) [Chunk 182], or (Author, Year, Chunk Index)
     Returns: list of citation dictionaries with author, year, chunk_info
     """
     citations = []
     
-    # Pattern 1: (Author, Year) [Chunk Number] - the expected format
-    pattern1 = r'\(([^,]+),\s*(\d{4})\)\s*\[(\d+)\]'
-    citations_found1 = re.findall(pattern1, response_text)
+    # Pattern 1a: (Author, Year) followed by one or more bracketed chunk numbers e.g. [12][34][56]
+    # This captures the author/year and the entire bracket run; we split numbers after
+    pattern1_multi = r'\(([^,]+),\s*(\d{4})\)\s*((?:\[\d+\]\s*)+)'
+    for author, year, bracket_run in re.findall(pattern1_multi, response_text):
+        numbers = re.findall(r'\[(\d+)\]', bracket_run)
+        for chunk_number in numbers:
+            citations.append({
+                'author': author.strip(),
+                'year': year.strip(),
+                'chunk_info': chunk_number.strip(),
+                'original': f"({author}, {year}) [{chunk_number}]"
+            })
     
-    for author, year, chunk_number in citations_found1:
+    # Pattern 1b: Fallback single bracket form for cases not covered above
+    pattern1_single = r'\(([^,]+),\s*(\d{4})\)\s*\[(\d+)\]'
+    for author, year, chunk_number in re.findall(pattern1_single, response_text):
         citations.append({
             'author': author.strip(),
             'year': year.strip(),
@@ -22,11 +33,23 @@ def parse_citations_from_response(response_text):
             'original': f"({author}, {year}) [{chunk_number}]"
         })
     
-    # Pattern 2: (Author, Year, Chunk Info) - legacy format for backward compatibility
-    pattern2 = r'\(([^,]+),\s*(\d{4}),\s*([^)]+)\)'
+    # Pattern 2: (Author, Year) [Chunk 182] - format with explicit "Chunk" text
+    pattern2 = r'\(([^,]+),\s*(\d{4})\)\s*\[Chunk\s+(\d+)\]'
     citations_found2 = re.findall(pattern2, response_text)
     
-    for author, year, chunk_info in citations_found2:
+    for author, year, chunk_number in citations_found2:
+        citations.append({
+            'author': author.strip(),
+            'year': year.strip(),
+            'chunk_info': f"Chunk {chunk_number.strip()}",
+            'original': f"({author}, {year}) [Chunk {chunk_number}]"
+        })
+    
+    # Pattern 3: (Author, Year, Chunk Info) - legacy format for backward compatibility
+    pattern3 = r'\(([^,]+),\s*(\d{4}),\s*([^)]+)\)'
+    citations_found3 = re.findall(pattern3, response_text)
+    
+    for author, year, chunk_info in citations_found3:
         citations.append({
             'author': author.strip(),
             'year': year.strip(),
@@ -165,7 +188,10 @@ def display_citation_expanders(citation_mapping):
     """
     Display citation expanders below the response text.
     """
+    print(f"🔍 DEBUG - display_citation_expanders called with {len(citation_mapping)} entries")
+    
     if not citation_mapping:
+        print("🔍 DEBUG - No citation mapping provided, returning early")
         return
     
     st.markdown("---")

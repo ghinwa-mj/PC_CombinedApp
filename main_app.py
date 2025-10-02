@@ -9,6 +9,7 @@ sys.path.append(current_dir)
 # Import the individual apps
 from chatbot_app_simplified import main as chatbot_main, initialize_chatbot_session_state
 from visualization_app import main as visualization_main
+from langfuse_config import create_conversation_trace
 
 # Page configuration
 st.set_page_config(
@@ -75,6 +76,21 @@ st.markdown("""
 def main():
     # Initialize session state globally
     initialize_chatbot_session_state()
+    
+    # Initialize Langfuse trace if not exists
+    if not st.session_state.get('langfuse_trace'):
+        st.session_state.langfuse_trace = create_conversation_trace(
+            session_id=st.session_state.get('conversation_id'),
+            metadata={"app": "policy_copilot_main", "version": "1.0"}
+        )
+        
+        # Track session started
+        from langfuse_config import track_session_started
+        track_session_started(
+            st.session_state.langfuse_trace,
+            st.session_state.get('conversation_id'),
+            {"app": "policy_copilot_main", "version": "1.0"}
+        )
     
     # Main header
     st.markdown("""

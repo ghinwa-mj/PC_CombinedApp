@@ -3,6 +3,7 @@ import weaviate
 from weaviate.classes.init import Auth
 import os
 import apikeys
+from langfuse.openai import openai as langfuse_openai
 from openai import OpenAI
 from sentence_transformers import CrossEncoder
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -11,9 +12,11 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langchain_openai import ChatOpenAI
 import uuid
 from rag_workflow import run_query, handle_memory_chat_query, get_rag_context_with_rerank
-from simple_citation_workflow import process_and_display_citations, display_citation_expanders, parse_citations_from_response
+from simple_citation_workflow import process_and_display_citations, display_citation_expanders, parse_citations_from_response, extract_chunk_numbers, get_chunk_data_from_weaviate, create_citation_mapping
 import json
 from simple_citation_workflow import display_persistent_citations
+from langfuse_config import create_conversation_trace, track_llm_call, track_error, track_performance, flush_langfuse_data
+import time
 
 
 def display_confirmation_ui(project_info):
@@ -58,17 +61,30 @@ def initialize_chatbot_session_state():
         st.session_state.message_count = 0
     if "chatbot_started" not in st.session_state:
         st.session_state.chatbot_started = False
+    # Langfuse tracking variables
+    if "langfuse_trace" not in st.session_state:
+        st.session_state.langfuse_trace = None
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = str(uuid.uuid4())
+    # One-time prompt logging flag
+    if "rag_prompts_logged" not in st.session_state:
+        st.session_state.rag_prompts_logged = False
 
-# Page configuration
-st.set_page_config(
-    page_title="Policy Copilot ChatBot",
-    layout="wide"
-)
+# Page configuration is handled in main_app.py
 
 # Initialize chatbot components
 def cleanup_weaviate_client():
     """Clean up Weaviate client connection"""
     try:
+        # Track session ended if trace exists
+        if st.session_state.get('langfuse_trace'):
+            from langfuse_config import track_session_ended
+            track_session_ended(
+                st.session_state.langfuse_trace,
+                st.session_state.get('conversation_id'),
+                {"app": "policy_copilot", "action": "app_cleanup"}
+            )
+        
         chatbot_components = st.session_state.get('chatbot_components', {})
         client = chatbot_components.get('client')
         if client:
@@ -91,9 +107,10 @@ def initialize_chatbot():
             }
         )
         
-        # Initialize OpenAI
+        # Initialize OpenAI with Langfuse wrapper for Sessions tracking
         os.environ["OPENAI_API_KEY"] = apikeys.OPENAI_API_KEY
-        openai = OpenAI()
+        # Use Langfuse OpenAI wrapper for automatic Sessions tracking
+        openai = langfuse_openai
         
         # Initialize rerank model
         rerank_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-12-v2')
@@ -112,6 +129,13 @@ def initialize_chatbot():
 def extract_project_info(user_input):
     """Extract project information from user input using OpenAI"""
     try:
+        # Initialize Langfuse trace if not exists
+        if not st.session_state.langfuse_trace:
+            st.session_state.langfuse_trace = create_conversation_trace(
+                session_id=st.session_state.conversation_id,
+                metadata={"app": "policy_copilot", "mode": "project_extraction"}
+            )
+        
         prompt = f"""
 You are a policy analysis assistant. Extract the following information from the user's project description:
 
@@ -150,19 +174,67 @@ Categorization Rules for developmental_outcome_category:
 - If categorized as any specific sector, set original_developmental_outcome to null
 """
 
+        # Track the LLM call
+        start_time = time.time()
+        
+        # Prepare metadata for Sessions tracking and prompt saving
+        session_metadata = {
+            "langfuse_session_id": st.session_state.conversation_id,
+            "task": "extract_project_info"
+        }
+        
+        # Add prompt to metadata if logging is enabled
+        from langfuse_config import truncate_prompt
+        truncated_prompt = truncate_prompt(prompt)
+        if truncated_prompt:
+            session_metadata["prompt_text"] = truncated_prompt
+            session_metadata["prompt_length"] = len(prompt)
+        
         response = st.session_state.chatbot_components['openai'].chat.completions.create(
+            name="project_info_extraction",
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a policy analysis assistant that extracts project information from user descriptions. Only respond with valid JSON."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0
+            temperature=0,
+            metadata=session_metadata
         )
+        end_time = time.time()
         
         result = json.loads(response.choices[0].message.content)
+        
+        # Track the LLM call in Langfuse
+        execution_time = end_time - start_time
+        track_llm_call(
+            trace=st.session_state.langfuse_trace,
+            name="project_info_extraction",
+            model="gpt-4o-mini",
+            input_text=user_input,
+            output_text=result,
+            usage={
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            },
+            metadata={"task": "extract_project_info"},
+            execution_time=execution_time
+        )
+        
+        # Track performance
+        track_performance(
+            trace=st.session_state.langfuse_trace,
+            operation_name="project_extraction",
+            execution_time=end_time - start_time,
+            metadata={"input_length": len(user_input)}
+        )
+        
         return result
         
     except Exception as e:
+        # Track error in Langfuse
+        if st.session_state.langfuse_trace:
+            track_error(st.session_state.langfuse_trace, e, {"operation": "extract_project_info", "user_input": user_input})
         st.error(f"Error extracting project info: {e}")
         return None
 
@@ -282,18 +354,14 @@ def display_confirmation_ui(project_info):
 **Developmental Outcome Category:** {selected_category}
 {f'**Specific Outcome:** {outcome_display}' if selected_category == "Other" else ''}
 
-Perfect! I now understand your project and I'm ready to help you with policy analysis questions.
+Perfect! I now understand your project.
+There are a few ways we could start exploring this issue. For example:
 
-**Some example questions I can help with:**
+Definitions – how {outcome_display} is defined in the literature.
+Measurement – common ways {outcome_display} is tracked and what to consider when interpreting data.
+Variations – visual trends showing how {outcome_display} differs by group (e.g., age, gender, region) and across countries.
 
-1. **Definition**: How is {outcome_display} defined in the literature?
-2. **Definition**: How should {outcome_display} be defined for this project?
-3. **Measurement**: How is {outcome_display} typically measured?
-4. **Measurement**: What should be taken into consideration when measuring {outcome_display}?
-5. **Drivers**: What are the common drivers of {outcome_display}?
-6. **Variation**: What are the common sources of variation in {outcome_display}?
-
-**Just ask me any of these questions or anything else about your project!**
+👉 Would you like to begin with one of these, or is there another question you’d like to dive into?
 """
                 st.session_state.messages.append({"role": "assistant", "content": confirmation_message})
                 st.rerun()
@@ -352,22 +420,8 @@ def main():
             ### Welcome to Policy Copilot ChatBot! 🤖
             
             I'm here to help you with policy analysis using our comprehensive document database.
-            
-            **To get started, please describe the developmental project you are working on.**
-            
-            I will extract:
-            - **Project Summary** (exactly what you describe)
-            - **Developmental Outcome** (what specific outcome your project is hoping to influence - e.g., unemployment, education, health, access to education services, literacy rates, stunting, etc...)
-            
-            For example:
-            - "I'm working on a project about youth unemployment in Kenya"
-            - "Our project is trying to target high levels of youth not in Education nor Training in Kenya"
-            - "Our project focuses on improving educational access in rural areas of Asia"
+            Could you briefly describe the development project you’re working on? Where possible, please include your project’s aim and context so I can tailor my analysis. (Example: “Youth unemployment in Kenya” or “Improving educational access in rural Asia”)
             """)
-    
-    # Display persistent citations if any exist
-    if st.session_state.project_defined and st.session_state.get('all_citations'):
-        display_persistent_citations()
     
     # Display confirmation UI if awaiting confirmation (this handles the case when no new input is provided)
     if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
@@ -378,6 +432,31 @@ def main():
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+    
+    # Display citations for the last RAG response (persistent across refreshes)
+    if (st.session_state.project_defined and 
+        st.session_state.first_rag_question_asked and 
+        st.session_state.messages and 
+        st.session_state.messages[-1]["role"] == "assistant"):
+        
+        last_response = st.session_state.messages[-1]["content"]
+        
+        # Process citations for the last response
+        try:
+            citations = parse_citations_from_response(last_response)
+            if citations:
+                chunk_numbers = extract_chunk_numbers(citations)
+                chunk_data = get_chunk_data_from_weaviate(chunk_numbers)
+                
+                if chunk_data:
+                    persistent_citation_mapping = create_citation_mapping(citations, chunk_data)
+                    
+                    if persistent_citation_mapping:
+                        # Display citations
+                        display_citation_expanders(persistent_citation_mapping)
+                        
+        except Exception as e:
+            st.error(f"Citation processing error: {str(e)}")
     
     # Chat input - dynamic placeholder based on project status
     chat_placeholder = "Ask me about your project..." if st.session_state.project_defined else "Describe your developmental project..."
@@ -392,9 +471,30 @@ def main():
             if st.session_state.project_defined:
                 # Memory-enabled RAG mode - handle questions about the defined project
                 with st.spinner("Searching through policy documents..."):
-                    response = handle_memory_chat_query(prompt, st.session_state.project_context)
-                    # Mark that the first RAG question has been asked
+                    # Initialize Langfuse trace if not exists
+                    if not st.session_state.langfuse_trace:
+                        st.session_state.langfuse_trace = create_conversation_trace(
+                            session_id=st.session_state.conversation_id,
+                            metadata={"app": "policy_copilot", "mode": "rag_query"}
+                        )
+                    
+                    # Track RAG query performance
+                    start_time = time.time()
                     st.session_state.first_rag_question_asked = True
+                    response = handle_memory_chat_query(prompt, st.session_state.project_context)
+                    end_time = time.time()
+                    
+                    # Track RAG performance in Langfuse
+                    track_performance(
+                        trace=st.session_state.langfuse_trace,
+                        operation_name="rag_query",
+                        execution_time=end_time - start_time,
+                        metadata={
+                            "project_context": st.session_state.project_context,
+                            "response_length": len(response)
+                        }
+                    )
+                    
             else:
                 # Project definition mode
                 with st.spinner("Analyzing your project description..."):
@@ -422,55 +522,9 @@ def main():
                                 response = generate_follow_up_prompt(missing_info, True)
                     else:
                         response = "I'm having trouble processing your project description. Please try again with a clear description of your developmental project."
-        
-        # Display assistant response with citations
-        if st.session_state.project_defined and st.session_state.first_rag_question_asked:
-            # For RAG responses, process citations
-            try:
-                # Process citations and display with expanders (uses direct Weaviate queries)
-                processed_response, citation_mapping = process_and_display_citations(response)
-                st.markdown(processed_response)
-                
-                # Display citation expanders for this response
-                if citation_mapping:
-                    display_citation_expanders(citation_mapping)
-                else:
-                    # Fallback to regular display if no context available
-                    st.markdown(response)
-            except Exception as e:
-                # Fallback to regular display if citation processing fails
-                st.markdown(response)
-                st.warning(f"Citation processing failed: {str(e)}")
-        else:
-            # For non-RAG responses, display normally
+            
+            # Display the response in the chat message
             st.markdown(response)
-        
-        # If we're awaiting confirmation, add response to messages and return
-        if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
-            return
-        
-
-        #### Update this later to add more features to the response already geenrated ####
-        # Add action buttons after the response (only after first RAG question)
-        #if st.session_state.project_defined and st.session_state.first_rag_question_asked:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if st.button("📋 Copy to Clipboard", key=f"copy_{len(st.session_state.messages)}"):
-                    # For now, just show a success message
-                    st.success("Response copied to clipboard! (Functionality coming soon)")
-            
-            with col2:
-                if st.button("🔍 Expand on Response", key=f"expand_{len(st.session_state.messages)}"):
-                    # For now, just show a success message
-                    st.info("Expansion feature coming soon!")
-            
-            with col3:
-                if st.button("📚 Generate Bibliography", key=f"bibliography_{len(st.session_state.messages)}"):
-                    # For now, just show a success message
-                    st.info("Bibliography generation coming soon!")
         
         # Add assistant response to chat history (only if not awaiting confirmation)
         if not st.session_state.awaiting_confirmation:
@@ -479,6 +533,12 @@ def main():
             st.session_state.message_count += 1
             # Rerun to show the new message in conversation history
             st.rerun()
+
+        # If we're awaiting confirmation, add response to messages and return
+        if st.session_state.awaiting_confirmation and st.session_state.pending_project_info:
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            st.rerun()
+            return
     
     # Sidebar with project context
     with st.sidebar:
@@ -515,6 +575,9 @@ def main():
         st.header("Tools")
         
         if st.button("🔄 Reset Chat"):
+            # Flush any pending Langfuse data before resetting
+            flush_langfuse_data()
+            
             st.session_state.messages = []
             st.session_state.project_context = {}
             st.session_state.project_defined = False
@@ -527,9 +590,26 @@ def main():
             # Reset citation tracking
             st.session_state.message_count = 0
             st.session_state.all_citations = {}
+            # Reset Langfuse tracking
+            st.session_state.langfuse_trace = None
+            st.session_state.conversation_id = str(uuid.uuid4())
+            # Reset one-time RAG prompt logging
+            st.session_state.rag_prompts_logged = False
             st.rerun()
         
         if st.button("⏹️ Stop Chat"):
+            # Track session ended before cleanup
+            if st.session_state.get('langfuse_trace'):
+                from langfuse_config import track_session_ended
+                track_session_ended(
+                    st.session_state.langfuse_trace,
+                    st.session_state.conversation_id,
+                    {"app": "policy_copilot", "action": "user_stopped"}
+                )
+            
+            # Flush any pending Langfuse data before stopping
+            flush_langfuse_data()
+            
             st.session_state.chatbot_started = False
             cleanup_weaviate_client()
             st.rerun()
