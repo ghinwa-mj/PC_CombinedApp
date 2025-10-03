@@ -255,6 +255,15 @@ def load_data():
         for path in possible_paths:
             if os.path.exists(path):
                 df = pd.read_csv(path)
+                # Ensure year column is always integer (handle non-numeric values gracefully)
+                original_count = len(df)
+                df['year'] = pd.to_numeric(df['year'], errors='coerce')
+                # Remove rows where year conversion failed
+                df = df.dropna(subset=['year'])
+                df['year'] = df['year'].astype(int)
+                cleaned_count = len(df)
+                if original_count != cleaned_count:
+                    print(f"Data cleaning: Removed {original_count - cleaned_count} rows with invalid year values")
                 break
         
         if df is None:
@@ -501,88 +510,7 @@ Keep the response concise, professional, and accessible to policy makers."""
     except Exception as e:
         return f"Error generating insights: {str(e)}"
 
-def smart_deduplicate_country_data(df, indicator_column):
-    """
-    Smart deduplication for country data.
-    For each year-country combination, keep the record with the most complete data.
-    """
-    if df.empty:
-        return df
-    
-    deduplicated_data = []
-    
-    for (year, country), group in df.groupby(['year', 'country']):
-        if len(group) == 1:
-            # Only one record for this year-country, keep it
-            deduplicated_data.append(group.iloc[0])
-        else:
-            # Multiple records for this year-country, choose the best one
-            best_record = None
-            best_score = -1
-            
-            for idx, record in group.iterrows():
-                # Score based on data completeness (non-null values)
-                score = 0
-                if not pd.isna(record[indicator_column]):
-                    score += 1
-                # Add more scoring criteria if needed
-                
-                # If this record has a better score, or same score but more recent (higher index)
-                if score > best_score or (score == best_score and idx > best_record.name if best_record is not None else True):
-                    best_record = record
-                    best_score = score
-            
-            if best_record is not None:
-                deduplicated_data.append(best_record)
-    
-    # Convert back to DataFrame
-    if deduplicated_data:
-        return pd.DataFrame(deduplicated_data)
-    else:
-        return df.iloc[0:0]  # Return empty DataFrame with same structure
-
-def smart_deduplicate_segmentation_data(df, segmentation_columns):
-    """
-    Smart deduplication for segmentation data.
-    For each year, keep the record with the most complete segmentation data.
-    """
-    if df.empty:
-        return df
-    
-    # Group by year and find the best record for each year
-    deduplicated_data = []
-    
-    for year in df['year'].unique():
-        year_data = df[df['year'] == year]
-        
-        if len(year_data) == 1:
-            # Only one record for this year, keep it
-            deduplicated_data.append(year_data.iloc[0])
-        else:
-            # Multiple records for this year, choose the best one
-            best_record = None
-            best_score = -1
-            
-            for idx, record in year_data.iterrows():
-                # Score based on number of non-null segmentation values
-                score = 0
-                for col in segmentation_columns:
-                    if col in record and not pd.isna(record[col]):
-                        score += 1
-                
-                # If this record has a better score, or same score but more recent (higher index)
-                if score > best_score or (score == best_score and idx > best_record.name if best_record is not None else True):
-                    best_record = record
-                    best_score = score
-            
-            if best_record is not None:
-                deduplicated_data.append(best_record)
-    
-    # Convert back to DataFrame
-    if deduplicated_data:
-        return pd.DataFrame(deduplicated_data)
-    else:
-        return df.iloc[0:0]  # Return empty DataFrame with same structure
+# Data deduplication functions removed - assuming dataset always has unique [country, year] data
 
 def format_annotation_value(value, dataset_values):
     """Format annotation value based on dataset characteristics"""
@@ -637,8 +565,7 @@ def create_time_trend_chart(df, selected_country, indicator_name):
         st.warning(f"No data available for {selected_country}")
         return None
     
-    # Ensure year column is numeric
-    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Check if the required column exists and has valid data
     if total_column not in country_data.columns:
@@ -658,8 +585,7 @@ def create_time_trend_chart(df, selected_country, indicator_name):
     # Sort by year
     country_data = country_data.sort_values('year')
     
-    # Deduplicate by year (keep first occurrence for each year)
-    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    # Dataset has unique [country, year] data - no deduplication needed
     
     # Check if we have multiple years
     years = country_data['year'].unique()
@@ -790,8 +716,7 @@ def create_segmented_trend_chart(df, selected_country, segmentation_type, indica
         st.warning(f"No data available for {selected_country}")
         return None
     
-    # Ensure year column is numeric
-    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Get segmentation columns for validation and processing
     columns = {key: val for key, val in segmentation_config.items() if key != 'labels'}
@@ -812,28 +737,9 @@ def create_segmented_trend_chart(df, selected_country, segmentation_type, indica
     # Sort by year
     country_data = country_data.sort_values('year')
     
-    # Smart deduplication: keep the record with the most complete segmentation data for each year
-    original_count = len(country_data)
-    country_data = smart_deduplicate_segmentation_data(country_data, segmentation_columns)
-    deduplicated_count = len(country_data)
+    # Dataset has unique [country, year] data - no deduplication needed
     
-    # Calculate data completeness metrics
-    total_years = len(country_data['year'].unique())
-    complete_years = 0
-    for year in country_data['year'].unique():
-        year_data = country_data[country_data['year'] == year]
-        if not year_data.empty:
-            # Check if all segmentation columns have non-null values for this year
-            has_all_data = all(not pd.isna(year_data[col].iloc[0]) for col in segmentation_columns if col in year_data.columns)
-            if has_all_data:
-                complete_years += 1
-    
-    # Show data completeness information
-    if original_count != deduplicated_count:
-        st.info(f"📊 Data Processing: {original_count} records → {deduplicated_count} records (removed {original_count - deduplicated_count} duplicates)")
-    
-    completeness_pct = (complete_years / total_years * 100) if total_years > 0 else 0
-    st.info(f"📈 Data Completeness: {complete_years}/{total_years} years ({completeness_pct:.1f}%) have complete segmentation data")
+    # Dataset is clean - no completeness calculations needed
     
     # Check if we have multiple years
     years = country_data['year'].unique()
@@ -1015,7 +921,7 @@ def create_country_comparison_chart(df, selected_countries, indicator_name):
         return None
     
     # Ensure year column is numeric
-    comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Ensure indicator column is numeric
     comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
@@ -1023,8 +929,7 @@ def create_country_comparison_chart(df, selected_countries, indicator_name):
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
     
-    # Apply smart deduplication (same as peer country function)
-    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
+    # Dataset has unique [country, year] data - no deduplication needed
     
     # Create the chart
     fig, ax = plt.subplots(figsize=(14, 8))
@@ -1144,7 +1049,7 @@ def calculate_global_averages(df, indicator_name):
         return None
     
     # Ensure year column is numeric
-    valid_data['year'] = pd.to_numeric(valid_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Ensure indicator column is numeric
     valid_data[total_column] = pd.to_numeric(valid_data[total_column], errors='coerce')
@@ -1194,7 +1099,7 @@ def calculate_regional_averages(df, indicator_name, selected_country):
         return None
     
     # Ensure year column is numeric
-    valid_data['year'] = pd.to_numeric(valid_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Ensure indicator column is numeric
     valid_data[total_column] = pd.to_numeric(valid_data[total_column], errors='coerce')
@@ -1236,8 +1141,7 @@ def create_global_benchmarking_chart(df, selected_country, indicator_name):
         st.warning(f"No data available for {selected_country}")
         return None
     
-    # Ensure year column is numeric
-    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Ensure indicator column is numeric
     country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
@@ -1267,8 +1171,7 @@ def create_global_benchmarking_chart(df, selected_country, indicator_name):
     # Sort by year
     country_data = country_data.sort_values('year')
     
-    # Deduplicate by year (keep first occurrence for each year)
-    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    # Dataset has unique [country, year] data - no deduplication needed
     
     # Filter averages to only include years where the country has data
     country_years = set(country_data['year'].unique())
@@ -1447,7 +1350,7 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
         return None
     
     # Ensure year and indicator columns are numeric
-    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
     
     # Remove rows with NaN values for the indicator
@@ -1460,8 +1363,7 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
     # Sort by year and get last 3 years
     country_data = country_data.sort_values('year')
     
-    # Deduplicate by year (keep first occurrence for each year)
-    country_data = country_data.drop_duplicates(subset=['year'], keep='first')
+    # Dataset has unique [country, year] data - no deduplication needed
     
     last_3_years_data = country_data.tail(3)
     
@@ -1484,10 +1386,7 @@ def create_benchmarking_bar_chart(df, selected_country, indicator_name):
     else:
         regional_averages, region_name = regional_result
     
-    # Ensure year columns are numeric
-    global_averages['year'] = pd.to_numeric(global_averages['year'], errors='coerce')
-    if regional_averages is not None:
-        regional_averages['year'] = pd.to_numeric(regional_averages['year'], errors='coerce')
+    # Year columns are already integer from load_data()
     
     # Filter averages to only include the last 3 years
     last_3_years = last_3_years_data['year'].unique()
@@ -1620,7 +1519,7 @@ def create_regional_comparison_chart(df, selected_country, indicator_name):
         return None
     
     # Ensure year and indicator columns are numeric
-    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
     
     # Remove rows with NaN values for the indicator
@@ -1641,7 +1540,7 @@ def create_regional_comparison_chart(df, selected_country, indicator_name):
     
     # Filter data for all countries in the same region for the latest year
     regional_data = df[df['region'] == region].copy()
-    regional_data['year'] = pd.to_numeric(regional_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     regional_data[total_column] = pd.to_numeric(regional_data[total_column], errors='coerce')
     
     # Get data for the latest year only
@@ -1770,7 +1669,7 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
         return None, explanation, []
     
     # Ensure year column is numeric
-    comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     
     # Ensure indicator column is numeric
     comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
@@ -1778,14 +1677,9 @@ def create_peer_country_comparison_chart(df, selected_country, indicator_name):
     # Sort by year
     comparison_data = comparison_data.sort_values('year')
     
-    # Apply smart deduplication
-    original_count = len(comparison_data)
-    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
-    deduplicated_count = len(comparison_data)
+    # Dataset has unique [country, year] data - no deduplication needed
     
-    # Show data processing information
-    if original_count != deduplicated_count:
-        st.info(f"📊 Data Processing: {original_count} records → {deduplicated_count} records (removed {original_count - deduplicated_count} duplicates)")
+    # Dataset is clean - no processing needed
     
     # Filter out countries that don't have any valid data for this indicator
     countries_with_data = []
@@ -1944,14 +1838,13 @@ def create_peer_country_bar_chart(df, selected_country, indicator_name, countrie
     comparison_data = df[df['country'].isin(countries_with_data)].copy()
     
     # Ensure year and indicator columns are numeric
-    comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+    # Year column is already integer from load_data()
     comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
     
     # Don't remove NaN values - we'll handle them in visualization
     # comparison_data = comparison_data.dropna(subset=[total_column])  # Removed this line
     
-    # Apply smart deduplication (same as line chart)
-    comparison_data = smart_deduplicate_country_data(comparison_data, total_column)
+    # Dataset has unique [country, year] data - no deduplication needed
     
     if comparison_data.empty:
         return None
@@ -2133,7 +2026,7 @@ def main():
                                 # Prepare data for AI analysis
                                 country_data = df[df['country'] == selected_country].copy()
                                 # Ensure year column is numeric before sorting
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 country_data = country_data.sort_values('year')
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                 total_column = indicator_info['total']
@@ -2157,7 +2050,7 @@ def main():
                         # Show data summary
                         country_data = df[df['country'] == selected_country].copy()
                         # Ensure year column is numeric before sorting
-                        country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                        # Year column is already integer from load_data()
                         country_data = country_data.sort_values('year')
                         st.markdown("### 📈 Data Summary")
                         
@@ -2295,7 +2188,7 @@ def main():
                                     # Prepare data for AI analysis
                                     country_data = df[df['country'] == selected_country].copy()
                                     # Ensure year column is numeric before sorting
-                                    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                    # Year column is already integer from load_data()
                                     country_data = country_data.sort_values('year')
                                     indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
                                     segmentation_config = segmentation_options[segmentation_type]
@@ -2324,7 +2217,7 @@ def main():
                             with st.expander("View Raw Data"):
                                 # Get the same data that was used for the visualization
                                 country_data_raw = df[df['country'] == selected_country].copy()
-                                country_data_raw['year'] = pd.to_numeric(country_data_raw['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 
                                 # Get segmentation config and columns
                                 segmentation_config = segmentation_options[segmentation_type]
@@ -2340,8 +2233,7 @@ def main():
                                 # Sort by year
                                 country_data_raw = country_data_raw.sort_values('year')
                                 
-                                # Apply smart deduplication (same as visualization)
-                                country_data_raw = smart_deduplicate_segmentation_data(country_data_raw, segmentation_columns)
+                                # Dataset is clean - no deduplication needed
                                 
                                 # Show only non-NA data
                                 columns_to_show = ['year'] + segmentation_columns
@@ -2465,7 +2357,7 @@ def main():
                             with cols[i]:
                                 country_data = df[df['country'] == country].copy()
                                 # Ensure year column is numeric before sorting
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 country_data = country_data.sort_values('year')
                                 valid_data = country_data.dropna(subset=[total_column])
                                 
@@ -2560,7 +2452,7 @@ def main():
                                 # Prepare data for AI analysis
                                 country_data = df[df['country'] == selected_country].copy()
                                 # Ensure year column is numeric before sorting
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 country_data = country_data.sort_values('year')
                                 global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
@@ -2608,7 +2500,7 @@ def main():
                                 # Prepare data for AI analysis (last 3 years)
                                 country_data = df[df['country'] == selected_country].copy()
                                 # Ensure year column is numeric before sorting
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
                                 country_data = country_data.sort_values('year')
                                 global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
@@ -2621,7 +2513,7 @@ def main():
                                 if not last_3_years_data.empty and global_averages is not None:
                                     # Filter global averages for the same years
                                     last_3_years = last_3_years_data['year'].unique()
-                                    global_averages['year'] = pd.to_numeric(global_averages['year'], errors='coerce')
+                                    # Year column is already integer from load_data()
                                     global_averages_filtered = global_averages[global_averages['year'].isin(last_3_years)]
                                     
                                     # Prepare combined data
@@ -2665,7 +2557,7 @@ def main():
                                 # Prepare data for AI analysis (regional comparison)
                                 country_data = df[df['country'] == selected_country].copy()
                                 # Ensure year column is numeric before sorting
-                                country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 country_data[total_column] = pd.to_numeric(country_data[total_column], errors='coerce')
                                 country_data = country_data.sort_values('year')
                                 indicator_info = OUTCOME_INDICATORS[st.session_state.selected_indicator]
@@ -2677,7 +2569,7 @@ def main():
                                 # Get regional data for the latest year
                                 region = country_data['region'].iloc[0]
                                 regional_data = df[df['region'] == region].copy()
-                                regional_data['year'] = pd.to_numeric(regional_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 regional_data[total_column] = pd.to_numeric(regional_data[total_column], errors='coerce')
                                 
                                 latest_year_data = regional_data[
@@ -2721,7 +2613,7 @@ def main():
                         # Get country data and global averages
                         country_data = df[df['country'] == selected_country].copy()
                         # Ensure year column is numeric before sorting
-                        country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                        # Year column is already integer from load_data()
                         country_data = country_data.sort_values('year')
                         global_averages = calculate_global_averages(df, st.session_state.selected_indicator)
                         
@@ -2751,9 +2643,9 @@ def main():
                                 
                                 # Find closest global average year
                                 # Ensure consistent data types for comparison
-                                latest_country_year_numeric = pd.to_numeric(latest_country_year, errors='coerce')
-                                global_averages['year'] = pd.to_numeric(global_averages['year'], errors='coerce')
-                                global_year_data = global_averages[global_averages['year'] == latest_country_year_numeric]
+                                # Year is already integer from load_data()
+                                # Year column is already integer from load_data()
+                                global_year_data = global_averages[global_averages['year'] == latest_country_year]
                                 if not global_year_data.empty and latest_country_value is not None:
                                     latest_global_value = float(global_year_data['global_average'].iloc[0])
                                     difference = latest_country_value - latest_global_value
@@ -2773,8 +2665,8 @@ def main():
                                 for year in country_years:
                                     country_value = valid_country_data[valid_country_data['year'] == year][total_column].iloc[0]
                                     # Ensure consistent data types for comparison
-                                    year_numeric = pd.to_numeric(year, errors='coerce')
-                                    global_year_data = global_averages[global_averages['year'] == year_numeric]
+                                    # Year is already integer from load_data()
+                                    global_year_data = global_averages[global_averages['year'] == year]
                                     if not global_year_data.empty:
                                         try:
                                             country_value = float(country_value)
@@ -2798,9 +2690,9 @@ def main():
                                 comparison_data = valid_country_data[['year', total_column]].copy()
                                 
                                 # Ensure both dataframes have consistent data types for the year column
-                                comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 global_averages_copy = global_averages[['year', 'global_average', 'country_count']].copy()
-                                global_averages_copy['year'] = pd.to_numeric(global_averages_copy['year'], errors='coerce')
+                                # Year column is already integer from load_data()
                                 
                                 comparison_data = comparison_data.merge(
                                     global_averages_copy, 
@@ -2910,7 +2802,7 @@ def main():
                                         total_column = indicator_info['total']
                                         
                                         # Ensure year and indicator columns are numeric
-                                        comparison_data['year'] = pd.to_numeric(comparison_data['year'], errors='coerce')
+                                        # Year column is already integer from load_data()
                                         comparison_data[total_column] = pd.to_numeric(comparison_data[total_column], errors='coerce')
                                         
                                         # Don't remove NaN values - we'll handle them in analysis
@@ -2991,7 +2883,7 @@ def main():
                                 with cols[i]:
                                     country_data = df[df['country'] == country].copy()
                                     # Ensure year column is numeric before sorting
-                                    country_data['year'] = pd.to_numeric(country_data['year'], errors='coerce')
+                                    # Year column is already integer from load_data()
                                     country_data = country_data.sort_values('year')
                                     valid_data = country_data.dropna(subset=[total_column])
                                     
